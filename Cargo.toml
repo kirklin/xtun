@@ -1,3 +1,39 @@
 [workspace]
 members = ["wire"]
-resolver = "3"
+
+[package]
+name = "xtun"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "TUN and TAP interfaces on Linux and Android, with batched and offloaded packet I/O"
+
+[features]
+default = ["tokio"]
+# Asynchronous reads and writes on a Tokio runtime.
+tokio = ["dep:tokio"]
+# Asynchronous reads and writes on async-io, the reactor of smol and async-std.
+async-io = ["dep:async-io"]
+# Readers as streams of packets and writers as sinks of packets.
+futures = ["dep:bytes", "dep:futures-core", "dep:futures-sink"]
+
+[dependencies]
+xtun-wire = { path = "wire" }
+async-io = { version = "2.6", optional = true }
+bytes = { version = "1.12", optional = true }
+futures-core = { version = "0.3.34", optional = true }
+futures-sink = { version = "0.3.34", optional = true }
+ipnet = "2"
+tokio = { version = "1.54", features = ["net", "rt", "time"], optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.180"
+
+[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+netlink-packet-core = "0.9"
+netlink-packet-route = "0.34"
+netlink-sys = { version = "0.9", default-features = false }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
