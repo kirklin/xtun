@@ -1,0 +1,82 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1320 580" width="1320" height="580">
+  <style>
+    text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #fff; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .title { font-size: 30px; font-weight: 600; }
+    .name { font-size: 23px; font-weight: 600; }
+    .sub { font-size: 15px; fill: #9a9a9a; }
+    .note { font-size: 16px; fill: #9a9a9a; }
+    .legend { font-size: 17px; fill: #d0d0d0; }
+    .caption { font-size: 22px; font-style: italic; fill: #e6e6e6; }
+    .box { stroke: #fff; stroke-opacity: 0.9; stroke-width: 1.5; }
+    .hdr { fill: #4F9BF7; }
+    .pay { fill: #5C5C5C; }
+    .call { fill: none; stroke: #F6E3A0; stroke-width: 1.5; }
+  </style>
+  <defs>
+    <g id="packet">
+      <rect class="box hdr" width="9" height="34"/>
+      <rect class="box pay" x="9" width="25" height="34"/>
+    </g>
+    <g id="single">
+      <rect class="call" width="48" height="48" rx="6"/>
+      <use href="#packet" x="7" y="7"/>
+    </g>
+    <g id="batch">
+      <rect class="call" width="288" height="48" rx="6"/>
+      <use href="#packet" x="7" y="7"/>
+      <use href="#packet" x="47" y="7"/>
+      <use href="#packet" x="87" y="7"/>
+      <use href="#packet" x="127" y="7"/>
+      <use href="#packet" x="167" y="7"/>
+      <use href="#packet" x="207" y="7"/>
+      <use href="#packet" x="247" y="7"/>
+    </g>
+  </defs>
+  <rect width="1320" height="580" fill="#000"/>
+
+  <text class="title" x="32" y="48">Packets per system call</text>
+  <rect class="call" x="800" y="30" width="18" height="18" rx="4"/>
+  <text class="legend" x="828" y="45">one system call</text>
+  <rect class="box hdr" x="988" y="30" width="18" height="18" rx="2"/>
+  <text class="legend" x="1016" y="45">headers</text>
+  <rect class="box pay" x="1108" y="30" width="18" height="18" rx="2"/>
+  <text class="legend" x="1136" y="45">payload</text>
+
+  <text class="name" x="64" y="142">Packet by packet</text>
+  <text class="mono sub" x="64" y="166">read · write</text>
+  <use href="#single" x="330" y="112"/>
+  <use href="#single" x="390" y="112"/>
+  <use href="#single" x="450" y="112"/>
+  <use href="#single" x="510" y="112"/>
+  <use href="#single" x="570" y="112"/>
+  <use href="#single" x="630" y="112"/>
+  <use href="#single" x="690" y="112"/>
+  <use href="#single" x="750" y="112"/>
+  <use href="#single" x="810" y="112"/>
+  <use href="#single" x="870" y="112"/>
+  <use href="#single" x="930" y="112"/>
+  <use href="#single" x="990" y="112"/>
+  <use href="#single" x="1050" y="112"/>
+  <use href="#single" x="1110" y="112"/>
+  <use href="#single" x="1170" y="112"/>
+  <text class="mono note" x="330" y="186">1 packet per call</text>
+
+  <text class="name" x="64" y="272">Batches</text>
+  <text class="mono sub" x="64" y="296">recvmsg_x · sendmsg_x</text>
+  <text class="mono sub" x="64" y="316">io_uring · Wintun rings</text>
+  <use href="#batch" x="330" y="242"/>
+  <use href="#batch" x="630" y="242"/>
+  <use href="#batch" x="930" y="242"/>
+  <text class="mono note" x="330" y="316">every packet that is ready, up to 64 per call</text>
+
+  <text class="name" x="64" y="402">Segments</text>
+  <text class="mono sub" x="64" y="426">virtio_net_hdr · tun_hdr</text>
+  <rect class="call" x="330" y="372" width="888" height="48" rx="6"/>
+  <rect class="box hdr" x="337" y="379" width="20" height="34"/>
+  <rect class="box pay" x="357" y="379" width="854" height="34"/>
+  <path d="M376.0 380V412M395.0 380V412M413.9 380V412M432.9 380V412M451.9 380V412M470.9 380V412M489.8 380V412M508.8 380V412M527.8 380V412M546.8 380V412M565.8 380V412M584.7 380V412M603.7 380V412M622.7 380V412M641.7 380V412M660.6 380V412M679.6 380V412M698.6 380V412M717.6 380V412M736.6 380V412M755.5 380V412M774.5 380V412M793.5 380V412M812.5 380V412M831.4 380V412M850.4 380V412M869.4 380V412M888.4 380V412M907.4 380V412M926.3 380V412M945.3 380V412M964.3 380V412M983.3 380V412M1002.2 380V412M1021.2 380V412M1040.2 380V412M1059.2 380V412M1078.2 380V412M1097.1 380V412M1116.1 380V412M1135.1 380V412M1154.1 380V412M1173.0 380V412M1192.0 380V412" stroke="#000" stroke-opacity="0.45" stroke-width="1.5"/>
+  <text class="mono note" x="330" y="446">one TCP or UDP segment of up to 64 KiB per call: about 45 packets, one copy of the headers</text>
+
+  <text class="caption" x="32" y="530">xtun moves as much as each system can take in one call.</text>
+</svg>

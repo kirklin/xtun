@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1320 920" width="1320" height="920">
+  <style>
+    text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #fff; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .title { font-size: 30px; font-weight: 600; }
+    .tick { font-size: 20px; }
+    .axis { font-size: 22px; }
+    .section { font-size: 21px; }
+    .value { font-size: 22px; }
+    .label { font-size: 21px; }
+    .caption { font-size: 22px; font-style: italic; fill: #e6e6e6; }
+    .bar { stroke: #fff; stroke-opacity: 0.9; stroke-width: 1.5; }
+  </style>
+  <rect width="1320" height="920" fill="#000"/>
+
+  <text class="title" x="32" y="48">TCP throughput</text>
+
+  <g stroke="#fff" stroke-width="2">
+    <line x1="218" y1="103" x2="218" y2="740"/>
+    <line x1="217" y1="740" x2="1290" y2="740"/>
+    <line x1="208" y1="103" x2="218" y2="103"/>
+    <line x1="208" y1="261.25" x2="218" y2="261.25"/>
+    <line x1="208" y1="419.5" x2="218" y2="419.5"/>
+    <line x1="208" y1="577.75" x2="218" y2="577.75"/>
+    <line x1="208" y1="736" x2="218" y2="736"/>
+  </g>
+  <g class="mono tick" text-anchor="end" dominant-baseline="central">
+    <text x="196" y="103">8</text>
+    <text x="196" y="261.25">6</text>
+    <text x="196" y="419.5">4</text>
+    <text x="196" y="577.75">2</text>
+    <text x="196" y="736">0</text>
+  </g>
+  <text class="axis" transform="translate(70 420) rotate(-90)" text-anchor="middle">Gbit/s (higher is better)</text>
+
+  <line x1="754" y1="103" x2="754" y2="736" stroke="#8a8a8a" stroke-width="2" stroke-dasharray="2 7"/>
+  <g class="section" text-anchor="middle">
+    <text x="486" y="126">Upload</text>
+    <text x="1022" y="126">Download</text>
+  </g>
+
+  <rect class="bar" x="353" y="274.7" width="86" height="461.3" rx="3" fill="#4F9BF7"/>
+  <rect class="bar" x="533" y="645.8" width="86" height="90.2" rx="3" fill="#5C5C5C"/>
+  <rect class="bar" x="889" y="284.2" width="86" height="451.8" rx="3" fill="#4F9BF7"/>
+  <rect class="bar" x="1069" y="646.6" width="86" height="89.4" rx="3" fill="#5C5C5C"/>
+
+  <g class="value" text-anchor="middle">
+    <text x="396" y="262">5.83</text>
+    <text x="576" y="633">1.14</text>
+    <text x="932" y="271">5.71</text>
+    <text x="1112" y="634">1.13</text>
+  </g>
+
+  <g class="label" text-anchor="middle">
+    <text x="396" y="776">xtun</text>
+    <text x="576" y="776">tun-rs</text>
+    <text x="932" y="776">xtun</text>
+    <text x="1112" y="776">tun-rs</text>
+  </g>
+
+  <text class="caption" x="32" y="852">One TCP flow through a reflector on each library's TUN device, in each direction.</text>
+  <text class="caption" x="32" y="886">Measured on macOS against tun-rs 2.8.18, medians of three rounds.</text>
+</svg>

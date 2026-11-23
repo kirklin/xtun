@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1320 620" width="1320" height="620">
+  <style>
+    text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #fff; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .title { font-size: 30px; font-weight: 600; }
+    .name { font-size: 28px; font-weight: 600; }
+    .desc { font-size: 18px; fill: #9a9a9a; }
+    .note { font-size: 17px; fill: #9a9a9a; }
+    .layer { fill: #0e0e0e; stroke: #2e2e2e; stroke-width: 1.5; }
+    .chip { stroke: #fff; stroke-opacity: 0.9; stroke-width: 1.5; }
+    .on-light { fill: #000; font-size: 20px; font-weight: 500; }
+    .on-dark { fill: #fff; font-size: 17px; font-weight: 500; }
+  </style>
+  <rect width="1320" height="620" fill="#000"/>
+
+  <text class="title" x="32" y="48">Architecture</text>
+
+  <rect class="layer" x="32" y="96" width="1256" height="150" rx="14"/>
+  <text class="name" x="64" y="150">xtun</text>
+  <text class="desc" x="64" y="182">the device</text>
+  <text class="desc" x="64" y="204">and its queues</text>
+  <g dominant-baseline="central" text-anchor="middle">
+    <rect class="chip" x="300" y="124" width="200" height="56" rx="8" fill="#4F9BF7"/>
+    <text class="on-light" x="400" y="152">Tun · Tap</text>
+    <rect class="chip" x="516" y="124" width="200" height="56" rx="8" fill="#4F9BF7"/>
+    <text class="on-light" x="616" y="152">Reader</text>
+    <rect class="chip" x="732" y="124" width="200" height="56" rx="8" fill="#4F9BF7"/>
+    <text class="on-light" x="832" y="152">Writer</text>
+  </g>
+  <text class="mono note" x="300" y="220">async · poll_ · try_ · blocking_, on Tokio or async-io</text>
+
+  <rect class="layer" x="32" y="266" width="1256" height="150" rx="14"/>
+  <text class="name" x="64" y="320">xtun-wire</text>
+  <text class="desc" x="64" y="352">bytes only,</text>
+  <text class="desc" x="64" y="374">no system calls</text>
+  <g dominant-baseline="central" text-anchor="middle">
+    <rect class="chip" x="300" y="294" width="220" height="56" rx="8" fill="#F6E3A0"/>
+    <text class="on-light" x="410" y="322">cut segments</text>
+    <rect class="chip" x="536" y="294" width="220" height="56" rx="8" fill="#F6E3A0"/>
+    <text class="on-light" x="646" y="322">join flows</text>
+    <rect class="chip" x="772" y="294" width="220" height="56" rx="8" fill="#F6E3A0"/>
+    <text class="on-light" x="882" y="322">checksums</text>
+    <rect class="chip" x="1008" y="294" width="220" height="56" rx="8" fill="#F6E3A0"/>
+    <text class="on-light" x="1118" y="322">frame headers</text>
+  </g>
+  <text class="mono note" x="300" y="390">virtio_net_hdr · tun_hdr · RFC 1071 · fuzzed</text>
+
+  <rect class="layer" x="32" y="436" width="1256" height="150" rx="14"/>
+  <text class="name" x="64" y="490">backends</text>
+  <text class="desc" x="64" y="522">one for</text>
+  <text class="desc" x="64" y="544">each system</text>
+  <g dominant-baseline="central" text-anchor="middle">
+    <rect class="chip" x="300" y="464" width="96" height="56" rx="8" fill="#5C5C5C"/>
+    <text class="on-dark" x="348" y="492">Linux</text>
+    <rect class="chip" x="407" y="464" width="96" height="56" rx="8" fill="#5C5C5C"/>
+    <text class="on-dark" x="455" y="492">Android</text>
+    <rect class="chip" x="514" y="464" width="96" height="56" rx="8" fill="#5C5C5C"/>
+    <text class="on-dark" x="562" y="492">macOS</text>
+    <rect class="chip" x="621" y="464" width="96" height="56" rx="8" fill="#5C5C5C"/>
+    <text class="on-dark" x="669" y="492">iOS</text>
+    <rect class="chip" x="728" y="464" width="96" height="56" rx="8" fill="#5C5C5C"/>
+    <text class="on-dark" x="776" y="492">FreeBSD</text>
+    <rect class="chip" x="835" y="464" width="96" height="56" rx="8" fill="#5C5C5C"/>
+    <text class="on-dark" x="883" y="492">NetBSD</text>
+    <rect class="chip" x="942" y="464" width="96" height="56" rx="8" fill="#5C5C5C"/>
+    <text class="on-dark" x="990" y="492">OpenBSD</text>
+    <rect class="chip" x="1049" y="464" width="96" height="56" rx="8" fill="#5C5C5C"/>
+    <text class="on-dark" x="1097" y="492">illumos</text>
+    <rect class="chip" x="1156" y="464" width="96" height="56" rx="8" fill="#5C5C5C"/>
+    <text class="on-dark" x="1204" y="492">Windows</text>
+  </g>
+  <text class="mono note" x="300" y="560">/dev/net/tun · utun · tun/tap · STREAMS · Wintun · TAP-Windows</text>
+</svg>

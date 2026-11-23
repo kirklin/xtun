@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1320 500" width="1320" height="500">
+  <style>
+    text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif; fill: #fff; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .title { font-size: 30px; font-weight: 600; }
+    .section { font-size: 21px; }
+    .name { font-size: 22px; font-weight: 600; }
+    .sub { font-size: 15px; }
+    .note { font-size: 16px; fill: #9a9a9a; }
+    .caption { font-size: 22px; font-style: italic; fill: #e6e6e6; }
+    .box { stroke: #fff; stroke-opacity: 0.9; stroke-width: 1.5; }
+    .on-light { fill: #000; }
+    .flow { stroke: #fff; stroke-width: 2; }
+  </style>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0 0 L10 5 L0 10 z" fill="#fff"/>
+    </marker>
+  </defs>
+  <rect width="1320" height="500" fill="#000"/>
+
+  <text class="title" x="32" y="48">Where it sits</text>
+
+  <g class="section" text-anchor="middle">
+    <text x="410" y="126">The system</text>
+    <text x="1053" y="126">Your process</text>
+  </g>
+  <line x1="803" y1="96" x2="803" y2="370" stroke="#8a8a8a" stroke-width="2" stroke-dasharray="2 7"/>
+
+  <g text-anchor="middle">
+    <rect class="box" x="64" y="170" width="190" height="110" rx="6" fill="#5C5C5C"/>
+    <text class="name" x="159" y="220">Applications</text>
+    <text class="sub" x="159" y="250">curl · ssh · a browser</text>
+
+    <rect class="box" x="310" y="170" width="190" height="110" rx="6" fill="#5C5C5C"/>
+    <text class="name" x="405" y="220">TCP/IP stack</text>
+    <text class="sub" x="405" y="250">sockets · routes</text>
+
+    <rect class="box" x="556" y="170" width="200" height="110" rx="6" fill="#F6E3A0"/>
+    <text class="name on-light" x="656" y="220">TUN · TAP</text>
+    <text class="sub on-light" x="656" y="250">a virtual interface</text>
+
+    <rect class="box" x="850" y="170" width="170" height="110" rx="6" fill="#4F9BF7"/>
+    <text class="name on-light" x="935" y="220">xtun</text>
+    <text class="sub on-light" x="935" y="250">Reader · Writer</text>
+
+    <rect class="box" x="1076" y="170" width="180" height="110" rx="6" fill="#5C5C5C"/>
+    <text class="name" x="1166" y="220">Your code</text>
+    <text class="sub" x="1166" y="250">handles the packets</text>
+  </g>
+
+  <g class="flow" marker-end="url(#arrow)">
+    <line x1="260" y1="206" x2="304" y2="206"/>
+    <line x1="506" y1="206" x2="550" y2="206"/>
+    <line x1="762" y1="206" x2="844" y2="206"/>
+    <line x1="1026" y1="206" x2="1070" y2="206"/>
+    <line x1="1070" y1="246" x2="1026" y2="246"/>
+    <line x1="844" y1="246" x2="762" y2="246"/>
+    <line x1="550" y1="246" x2="506" y2="246"/>
+    <line x1="304" y1="246" x2="260" y2="246"/>
+  </g>
+
+  <g text-anchor="middle">
+    <text class="mono note" x="656" y="312">tun0 · utun4 · Wintun</text>
+    <text class="mono note" x="656" y="334">10.0.0.1/24</text>
+    <text class="mono note" x="935" y="312">batches</text>
+    <text class="mono note" x="935" y="334">and segments</text>
+  </g>
+
+  <text class="caption" x="32" y="424">What the system routes to the interface comes out of a Reader. What goes into a Writer enters</text>
+  <text class="caption" x="32" y="458">the system as if it had arrived on a network card.</text>
+</svg>
