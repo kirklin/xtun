@@ -17,20 +17,20 @@ import process from "node:process";
 import { features } from "../linux.ts";
 import { download, home, key, must, run, sourceArchive } from "./common.ts";
 
-const wintun = {
+export const wintun = {
   url: "https://www.wintun.net/builds/wintun-0.14.1.zip",
   // As www.wintun.net lists it.
   sha256: "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51",
 };
-const tapWindows = {
+export const tapWindows = {
   url: "https://github.com/OpenVPN/tap-windows6/releases/download/9.27.0/dist.win10.zip",
   // The release lists no digest: this is the digest of the file that release served.
   sha256: "36e2609b7ceefedcb978ce5c48caf9e0e5af83423717c4e2e3c1d7ebca8f62a5",
 };
 /// The name of the firewall rule that the run adds and removes.
-const rule = "xtun-tests";
+export const rule = "xtun-tests";
 /// The addresses of the test subnets in `tests/windows.rs`.
-const testAddresses = "10.160.0.0/11,fd00::/8";
+export const testAddresses = "10.160.0.0/11,fd00::/8";
 
 export function sshArgs(target: string): string[] {
   return [

@@ -1,0 +1,291 @@
+# The unit tests and the device tests on every system the library has devices for, and on several
+# versions of each, so that nothing comes to lean on what one version of a system happens to do.
+# The device tests make real interfaces, as root or as an administrator.
+#
+# Linux runs on three kernels of GitHub's own machines and, in virtual machines, on the kernels of
+# older and newer distributions. macOS, iOS and Windows run on the versions GitHub has. FreeBSD,
+# NetBSD, OpenBSD and illumos run in virtual machines, Android on emulators.
+#
+# The features are every runtime and adapter, as `scripts/linux.ts` has them.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Every Monday: the machines, the images and the packages move on without a commit here.
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: linux (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-22.04
+          - ubuntu-24.04
+          - ubuntu-26.04
+          - ubuntu-22.04-arm
+          - ubuntu-24.04-arm
+          - ubuntu-26.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+      - name: System
+        run: uname -srm && rustc --version
+      - name: Unit tests
+        run: |
+          cargo test --release --locked -p xtun-wire --lib
+          cargo test --release --locked --features async-io,futures --lib
+      - name: Device tests
+        run: >
+          cargo test --release --locked --no-fail-fast --features async-io,futures
+          --test device --test tap --test kernel
+          --config "target.'cfg(unix)'.runner = '$PWD/scripts/ci/root.sh'"
+          -- --ignored --test-threads=1 --nocapture
+
+  # The kernels GitHub's machines do not have. The test programs are built once, linked statically,
+  # and run in a virtual machine of each distribution, which needs no toolchain for them.
+  linux-kernel:
+    name: linux kernel (${{ matrix.guest }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # The kernels: 4.18, 5.4, 5.10, 5.14, 6.1, 6.12 and the newest Fedora has.
+        guest:
+          - almalinux-8
+          - ubuntu-20.04
+          - debian-11
+          - almalinux-9
+          - debian-12
+          - debian-13
+          - fedora-45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+          rustup target add x86_64-unknown-linux-musl
+      - name: Build the tests as static programs
+        run: |
+          programs() {
+            cargo test --release --locked --target x86_64-unknown-linux-musl "$@" --no-run --message-format=json \
+              | jq -r 'select(.reason == "compiler-artifact" and .executable != null) | .executable'
+          }
+          mkdir -p target/ci
+          programs -p xtun-wire --lib | xargs -I{} cp {} target/ci/
+          programs --features async-io,futures --lib --test device --test tap --test kernel | xargs -I{} cp {} target/ci/
+          ls -l target/ci
+      - uses: lima-vm/lima-actions/setup@55627e31b78637bf254a8b2a14da8ea7d12564e5 # v1.1.0
+        with:
+          version: v2.3.0
+      - name: Start the virtual machine
+        run: limactl start --plain --name=default --cpus=4 --memory=4 --tty=false template://${{ matrix.guest }}
+      - name: Copy the tests
+        run: tar -cf - scripts/ci/root.sh -C target ci | ssh lima-default 'mkdir xtun && tar -xf - -C xtun'
+      - name: Unit tests and device tests
+        run: |
+          ssh lima-default '
+            cd xtun
+            uname -srm
+            status=0
+            for program in ci/*; do
+              case "$(basename "$program")" in
+                device-* | tap-* | kernel-*) sh scripts/ci/root.sh "$program" --ignored --test-threads=1 --nocapture || status=1 ;;
+                *) "$program" || status=1 ;;
+              esac
+            done
+            exit $status
+          '
+
+  macos:
+    name: macos (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-15
+          - macos-26
+          - macos-15-intel
+          - macos-26-intel
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+      - name: System
+        run: sw_vers && uname -m && rustc --version
+      - name: Unit tests
+        run: |
+          cargo test --release --locked -p xtun-wire --lib
+          cargo test --release --locked --features async-io,futures --lib
+      - name: Device tests
+        run: >
+          cargo test --release --locked --no-fail-fast --features async-io,futures
+          --test device --test tap
+          --config "target.'cfg(unix)'.runner = '$PWD/scripts/ci/root.sh'"
+          -- --ignored --test-threads=1 --nocapture
+
+  # The unit tests inside a simulated iPhone of the newest runtime the machine's Xcode has, and
+  # the device tests as programs of that runtime.
+  ios:
+    name: ios (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-15
+          - macos-26
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rust-src --no-self-update
+          rustup default stable
+      - name: System
+        run: sw_vers && xcodebuild -version && node --version && rustc --version
+      - name: Unit tests and device tests
+        run: node scripts/ios.ts
+
+  windows:
+    name: windows (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-2022
+          - windows-2025
+          - windows-11-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+      - name: System
+        run: cmd //c ver && node --version && rustc --version --verbose
+      - name: Wintun and the TAP-Windows6 driver
+        run: node scripts/ci/windows.ts "$RUNNER_TEMP/xtun"
+      - name: Unit tests
+        run: |
+          cargo test --release --locked -p xtun-wire --lib
+          cargo test --release --locked --features async-io,futures --lib
+      - name: Device tests
+        run: >
+          cargo test --release --locked --no-fail-fast --features async-io,futures
+          --test windows
+          -- --ignored --test-threads=1 --nocapture
+
+  # FreeBSD, NetBSD, OpenBSD and illumos in virtual machines. OpenBSD has no Rust but its own
+  # package's, which is too old for the workspace before 7.8. illumos has no TAP devices here.
+  bsd:
+    name: ${{ matrix.system }} ${{ matrix.version }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { system: freebsd, version: "13.5", tests: --test device --test tap }
+          - { system: freebsd, version: "14.5", tests: --test device --test tap }
+          - { system: freebsd, version: "15.1", tests: --test device --test tap }
+          - { system: netbsd, version: "9.5", tests: --test device --test tap }
+          - { system: netbsd, version: "10.2", tests: --test device --test tap }
+          - { system: netbsd, version: "11.1", tests: --test device --test tap }
+          - { system: openbsd, version: "7.8", tests: --test device --test tap }
+          - { system: openbsd, version: "7.9", tests: --test device --test tap }
+          - { system: openbsd, version: "8.0", tests: --test device --test tap }
+          - { system: omnios, version: r151056, tests: --test device }
+          - { system: omnios, version: r151058, tests: --test device }
+          - { system: omnios, version: r151060, tests: --test device }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Start the virtual machine
+        uses: cross-platform-actions/action@30cde56b87a128507bebea9531205087890ee360 # v1.8.0
+        with:
+          operating_system: ${{ matrix.system }}
+          version: ${{ matrix.version }}
+          cpu_count: 4
+          memory: 6G
+          shell: sh
+          sync_files: runner-to-vm
+          environment_variables: CARGO_TERM_COLOR
+      - name: Rust
+        shell: cpa.sh {0} --sync-files runner-to-vm
+        run: |
+          set -eu
+          case "$(uname -s)" in
+            OpenBSD) sudo pkg_add rust ;;
+            SunOS) sudo pkg install ooce/developer/rust driver/tuntap ;;
+            *) curl --proto '=https' --tlsv1.2 --fail --silent --show-error https://sh.rustup.rs | sh -s -- -y --profile minimal ;;
+          esac
+      - name: System
+        shell: cpa.sh {0} --sync-files none
+        run: |
+          if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi
+          uname -a && rustc --version && cc --version
+      - name: Unit tests
+        shell: cpa.sh {0} --sync-files none
+        run: |
+          if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi
+          cargo test --release --locked -p xtun-wire --lib
+      - name: Device tests
+        shell: cpa.sh {0} --sync-files none
+        run: |
+          if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi
+          cargo test --release --locked --no-fail-fast --features async-io,futures ${{ matrix.tests }} \
+            --config "target.'cfg(unix)'.runner = '$PWD/scripts/ci/root.sh'" \
+            -- --ignored --test-threads=1 --nocapture
+
+  # `scripts/android.ts` makes its virtual device from the newest system image the SDK has, which
+  # is the one of the job's API level, and runs the tests in it as root.
+  android:
+    name: android (api ${{ matrix.api }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        api: [24, 30, 34, 36]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+          rustup target add x86_64-linux-android
+      - name: Let the emulator use the processor's virtualization
+        run: sudo chown "$USER" /dev/kvm
+      - name: Emulator and system image
+        run: |
+          sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$sdkmanager" --licenses > /dev/null || true
+          "$sdkmanager" --install emulator platform-tools "system-images;android-${{ matrix.api }};google_apis;x86_64" > /dev/null
+          ls "$ANDROID_HOME/system-images" "$ANDROID_HOME/ndk"
+      - name: Unit tests and device tests
+        run: node --version && node scripts/android.ts
