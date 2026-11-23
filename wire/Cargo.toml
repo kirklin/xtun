@@ -3,7 +3,7 @@ name = "xtun-wire"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "The bytes of batched and offloaded packet I/O, without any device: checksums"
+description = "The bytes of batched and offloaded packet I/O, without any device: checksums, cutting segments, joining packets and the prefixes devices put in front of frames"
 
 [dev-dependencies]
 proptest = "1.12"
