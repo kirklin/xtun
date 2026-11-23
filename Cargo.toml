@@ -1,0 +1,3 @@
+[workspace]
+members = ["wire"]
+resolver = "3"

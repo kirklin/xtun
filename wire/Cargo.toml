@@ -1,0 +1,13 @@
+[package]
+name = "xtun-wire"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "The bytes of batched and offloaded packet I/O, without any device: checksums"
+
+[dev-dependencies]
+proptest = "1.12"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
