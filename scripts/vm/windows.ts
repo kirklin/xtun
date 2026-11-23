@@ -32,7 +32,7 @@ const rule = "xtun-tests";
 /// The addresses of the test subnets in `tests/windows.rs`.
 const testAddresses = "10.160.0.0/11,fd00::/8";
 
-function sshArgs(target: string): string[] {
+export function sshArgs(target: string): string[] {
   return [
     "-i", key().secret,
     "-o", "StrictHostKeyChecking=no",
@@ -47,7 +47,7 @@ function sshArgs(target: string): string[] {
 }
 
 /// Runs a command line of `cmd.exe` in the guest; it has to succeed.
-function sshMust(target: string, command: string, input?: Buffer): string {
+export function sshMust(target: string, command: string, input?: Buffer): string {
   const result = run("ssh", [...sshArgs(target), command], { input });
   if (result.code !== 0) {
     throw new Error(`in the guest, ${command} failed:\n${result.out}\n${result.err}`);
@@ -57,12 +57,12 @@ function sshMust(target: string, command: string, input?: Buffer): string {
 
 /// Runs a command line of `cmd.exe` in the guest, showing what it prints as it comes. Returns
 /// its status.
-function sshShown(target: string, command: string): number {
+export function sshShown(target: string, command: string): number {
   return spawnSync("ssh", [...sshArgs(target), command], { stdio: "inherit" }).status ?? -1;
 }
 
 /// Runs PowerShell in the guest; it has to succeed.
-function powershell(target: string, script: string): string {
+export function powershell(target: string, script: string): string {
   return sshMust(target, `powershell -NoProfile -NonInteractive -Command "${script}"`);
 }
 
@@ -89,7 +89,7 @@ function payload(directory: string, arch: "arm64" | "amd64"): Buffer {
 }
 
 /// A Windows machine reached over SSH, and where a run keeps its files there.
-interface Guest {
+export interface Guest {
   target: string;
   arch: "arm64" | "amd64";
   /// The source tree with its dependencies.
@@ -101,7 +101,7 @@ interface Guest {
 }
 
 /// The machine at `target`, as `user@address`.
-function guest(target: string | undefined, usage: string): Guest {
+export function guest(target: string | undefined, usage: string): Guest {
   if (target === undefined || !target.includes("@")) {
     throw new Error(`usage: ${usage}`);
   }
@@ -112,23 +112,23 @@ function guest(target: string | undefined, usage: string): Guest {
 }
 
 /// Puts `wintun.dll` and the files of the TAP-Windows6 driver into the guest.
-function pushTools(machine: Guest): void {
+export function pushTools(machine: Guest): void {
   sshMust(machine.target, fresh(machine.tools), payload(home("windows"), machine.arch));
 }
 
 /// Puts the source tree and its dependencies into the guest, replacing what is there.
-function pushSource(machine: Guest): void {
+export function pushSource(machine: Guest): void {
   sshMust(machine.target, fresh(machine.source), sourceArchive());
 }
 
 /// The start of a command line of `cmd.exe` that runs cargo in the guest's source tree.
-function inSource(machine: Guest): string {
+export function inSource(machine: Guest): string {
   return `cd /d "${machine.source}" && set CARGO_TARGET_DIR=${machine.targetDir}&& `;
 }
 
 /// Runs `action` while a firewall rule lets inbound traffic to `addresses` through, so that a
 /// connection through an adapter reaches its listener. The rule goes when the action ends.
-function withFirewall<T>(machine: Guest, addresses: string, action: () => T): T {
+export function withFirewall<T>(machine: Guest, addresses: string, action: () => T): T {
   powershell(machine.target, `Remove-NetFirewallRule -Name ${rule} -ErrorAction SilentlyContinue; ` +
     `New-NetFirewallRule -Name ${rule} -DisplayName ${rule} -Direction Inbound -Action Allow -Profile Any -LocalAddress ${addresses} | Out-Null`);
   try {
@@ -161,4 +161,6 @@ function main(): void {
   process.exit(status);
 }
 
-main();
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main();
+}

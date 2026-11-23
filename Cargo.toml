@@ -1,5 +1,5 @@
 [workspace]
-members = ["wire"]
+members = ["wire", "bench"]
 
 [package]
 name = "xtun"

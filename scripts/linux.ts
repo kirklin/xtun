@@ -15,13 +15,13 @@ const image = "xtun-test";
 /// Every runtime and adapter, so that the tests cover them all.
 export const features = "--features async-io,futures";
 
-const volumes = [
+export const volumes = [
   "-v", `${repo}:/src:ro`,
   "-v", "xtun-target:/target",
   "-v", "xtun-cargo:/usr/local/cargo/registry",
 ];
 
-const privileged = [
+export const privileged = [
   "--privileged",
   "--sysctl", "net.ipv6.conf.all.disable_ipv6=0",
   "--sysctl", "net.ipv6.conf.default.disable_ipv6=0",
@@ -31,14 +31,14 @@ const privileged = [
   "--sysctl", "net.ipv4.conf.default.rp_filter=0",
 ];
 
-const environment = [
+export const environment = [
   "-e", "CARGO_TARGET_DIR=/target",
   "-e", `CARGO_HTTP_PROXY=${proxy}`,
   "-e", `http_proxy=${proxy}`,
   "-e", `https_proxy=${proxy}`,
 ];
 
-function buildImage(): string {
+export function buildImage(): string {
   const result = spawnSync(
     "docker",
     ["build", "-q", "-t", image, "--build-arg", `http_proxy=${proxy}`, "--build-arg", `https_proxy=${proxy}`, resolve(here, "linux")],
