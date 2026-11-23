@@ -34,6 +34,11 @@ netlink-packet-core = "0.9"
 netlink-packet-route = "0.34"
 netlink-sys = { version = "0.9", default-features = false }
 
+[dev-dependencies]
+async-io = "2.6"
+futures-util = { version = "0.3.34", features = ["sink"] }
+tokio = { version = "1.54", features = ["full"] }
+
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
 missing_docs = "warn"
