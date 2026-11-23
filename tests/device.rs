@@ -5,7 +5,10 @@
     target_os = "linux",
     target_os = "android",
     target_os = "macos",
-    target_os = "ios"
+    target_os = "ios",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
 ))]
 
 mod common;
@@ -121,7 +124,7 @@ async fn udp_round_trip(offload: bool, on: bool) {
         };
         let header = if data[0] >> 4 == 6 { 40 } else { 20 };
         assert_eq!(&data[header + 8..], b"hello through the device");
-        if offload && cfg!(any(target_os = "linux", target_os = "android")) {
+        if offload && cfg!(any(target_os = "linux", target_os = "android", target_os = "openbsd")) {
             assert!(matches!(checksum, Checksum::Partial { .. }), "{checksum:?}");
         }
         let reply = Build { src: ip(remote), dst: ip(local), src_port: 9, dst_port: port, ttl: 64, id: 1 }.udp(b"and back");
@@ -141,7 +144,7 @@ async fn udp_round_trip_plain() {
     udp_round_trip(false, false).await;
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "openbsd"))]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "creates interfaces: run as root with --ignored"]
 async fn udp_round_trip_offload() {
@@ -176,7 +179,7 @@ async fn through_reflector(offload: bool, mode: Mode, v6: bool, queues: usize, o
     stop(tasks).await;
     let (segments, packets, writes) = counters.get();
     println!("offload {offload} {mode:?} v6 {v6} queues {queues}: {segments} segments read, {packets} packets in {writes} writes");
-    if offload && cfg!(any(target_os = "linux", target_os = "android")) {
+    if offload && cfg!(any(target_os = "linux", target_os = "android", target_os = "openbsd")) {
         if mode != Mode::Packets {
             assert!(segments > 0, "the kernel hands over segments");
         }
@@ -333,7 +336,7 @@ async fn tcp_through_the_device() {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "openbsd"))]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "creates interfaces: run as root with --ignored"]
 async fn tcp_through_the_device_with_offload() {
@@ -526,6 +529,7 @@ fn renames_and_brings_up_and_down() {
 #[test]
 #[ignore = "creates interfaces: run as root with --ignored"]
 fn brings_up_and_down() {
+    // FreeBSD runs a tun interface once it has an address.
     let (device, _queues) = builder("xtuntest10").address(net("10.96.0.1/24")).up(false).build().unwrap();
     assert!(!device.is_up().unwrap());
     device.set_up(true).unwrap();
@@ -533,8 +537,18 @@ fn brings_up_and_down() {
     assert!(eventually(|| device.is_running().unwrap()));
     device.set_up(false).unwrap();
     assert!(!device.is_up().unwrap());
-    assert_eq!(device.set_name("xtun7").unwrap_err().kind(), io::ErrorKind::Unsupported, "a utun interface keeps its name");
-    assert_eq!(device.set_persist(true).unwrap_err().kind(), io::ErrorKind::Unsupported, "a utun interface goes with its socket");
+    // FreeBSD renames interfaces; the others keep their names.
+    let renamed = device.set_name("xtun7");
+    if cfg!(target_os = "freebsd") {
+        renamed.unwrap();
+        assert_eq!(device.name().unwrap(), "xtun7");
+        assert!(exists("xtun7"));
+    } else {
+        assert_eq!(renamed.unwrap_err().kind(), io::ErrorKind::Unsupported);
+    }
+    if cfg!(target_vendor = "apple") {
+        assert_eq!(device.set_persist(true).unwrap_err().kind(), io::ErrorKind::Unsupported, "a utun interface goes with its socket");
+    }
 }
 
 #[test]
@@ -687,6 +701,8 @@ fn hands_over_its_descriptor() {
     assert_eq!(device.name().unwrap(), name);
     let (mut reader, _writer) = queue.split().unwrap();
     sent_through(&mut reader, "10.90.0.1", "10.90.0.2", b"through the handed over descriptor");
+    // NetBSD keeps the interface after the descriptor is closed, unless the device removes it.
+    device.set_persist(false).unwrap();
 }
 
 #[test]

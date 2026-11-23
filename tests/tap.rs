@@ -1,8 +1,15 @@
-//! Tests on real layer 2 interfaces: TAP interfaces on Linux, pairs of `feth` interfaces on
-//! macOS. They need the privilege to create interfaces and are ignored by default:
+//! Tests on real layer 2 interfaces: TAP interfaces on Linux and the BSDs, pairs of `feth`
+//! interfaces on macOS. They need the privilege to create interfaces and are ignored by default:
 //! `cargo test -- --ignored --test-threads=1` as root, or `node scripts/linux.ts`.
 
-#![cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+#![cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
 
 mod common;
 
@@ -198,7 +205,7 @@ async fn udp_round_trip_plain() {
     udp_round_trip("xtuntap0", false).await;
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd", target_os = "openbsd"))]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "creates interfaces: run as root with --ignored"]
 async fn udp_round_trip_offload() {
@@ -221,7 +228,7 @@ async fn through_reflector(offload: bool, mode: Mode, v6: bool) {
     stop(vec![task]).await;
     let (segments, packets, writes) = counters.get();
     println!("offload {offload} {mode:?} v6 {v6}: {segments} segments read, {packets} packets in {writes} writes");
-    if offload && cfg!(any(target_os = "linux", target_os = "android")) {
+    if offload && cfg!(any(target_os = "linux", target_os = "android", target_os = "freebsd", target_os = "openbsd")) {
         if mode != Mode::Packets {
             assert!(segments > 0, "the kernel hands over segments of Ethernet frames");
         }
@@ -245,7 +252,7 @@ async fn tcp_through_frames() {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd", target_os = "openbsd"))]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "creates interfaces: run as root with --ignored"]
 async fn tcp_through_frames_with_offload() {
@@ -287,4 +294,20 @@ fn a_persistent_device_stays_and_is_taken_over() {
     device.set_persist(false).unwrap();
     drop((device, queues));
     assert!(!exists(&name), "told it may go, the interface goes with the device");
+}
+
+/// FreeBSD renames interfaces: a descriptor is known for what it is by its device.
+#[cfg(target_os = "freebsd")]
+#[test]
+#[ignore = "creates interfaces: run as root with --ignored"]
+fn a_renamed_device_is_handed_over_as_what_it_is() {
+    let (device, mut queues) = builder("xtuntap4").build().unwrap();
+    device.set_name("xtunrenamed").unwrap();
+    let fd = device.into_fd(queues.remove(0)).unwrap();
+    let (device, _queue) = Tap::from_fd(fd).unwrap();
+    assert_eq!(device.name().unwrap(), "xtunrenamed");
+    assert_eq!(device.mac_address().unwrap(), DEVICE_MAC);
+    device.set_persist(false).unwrap();
+    drop((device, _queue));
+    assert!(!exists("xtunrenamed"));
 }
