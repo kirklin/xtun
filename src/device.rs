@@ -95,6 +95,9 @@ pub struct Options {
     pub persist: bool,
     /// Whether an interface of the name that already exists is taken over.
     pub reuse: bool,
+    /// Whether reads and writes go through io_uring.
+    #[cfg(target_os = "linux")]
+    pub uring: Uring,
     /// Whether a full queue pauses the kernel's sending.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub backpressure: bool,
@@ -107,6 +110,21 @@ pub struct Options {
     /// The group whose members may open a persistent interface.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub group: Option<u32>,
+}
+
+/// Whether reads and writes on Linux go through io_uring, one system call for a whole batch.
+/// Only 64-bit Linux has it; Android does not let applications use it.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Uring {
+    /// io_uring where the kernel can complete reads and writes of the device without waiting
+    /// (Linux 6.4 and later) and the system allows it; plain system calls otherwise.
+    #[default]
+    Auto,
+    /// Plain system calls only.
+    Off,
+    /// io_uring or nothing: creating the device fails where it cannot be used.
+    Required,
 }
 
 impl<L: Layer> Default for Builder<L> {
@@ -125,6 +143,8 @@ impl<L: Layer> Default for Builder<L> {
                 prefix_routes: true,
                 persist: false,
                 reuse: true,
+                #[cfg(target_os = "linux")]
+                uring: Uring::Auto,
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 backpressure: true,
                 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -245,6 +265,13 @@ impl<L: Layer> Builder<L> {
     /// read and written as they are, without checksum work or segmentation.
     pub fn packet_information(mut self, on: bool) -> Builder<L> {
         self.options.packet_information = on;
+        self
+    }
+
+    /// Whether reads and writes go through io_uring.
+    #[cfg(target_os = "linux")]
+    pub fn uring(mut self, uring: Uring) -> Builder<L> {
+        self.options.uring = uring;
         self
     }
 

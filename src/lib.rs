@@ -32,6 +32,8 @@ mod sys;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use device::Tap;
+#[cfg(target_os = "linux")]
+pub use device::Uring;
 pub use device::{Builder, Device, Offload, Tun};
 pub use xtun_wire::{Checksum, Frame, Gso, GsoKind, Packet, Segments, checksum};
 pub use io::{Batch, Interrupt, Queue, Reader, ReaderStats, Writer, WriterStats};

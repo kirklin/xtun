@@ -4,6 +4,11 @@
 
 mod interface;
 mod netlink;
+#[cfg(all(target_os = "linux", target_pointer_width = "64"))]
+mod uring;
+#[cfg(not(all(target_os = "linux", target_pointer_width = "64")))]
+#[path = "nouring.rs"]
+mod uring;
 
 use std::io::{Error, ErrorKind, Result};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
@@ -13,7 +18,7 @@ use xtun_wire::{Framing, MAX_PREFIX, Prefix, Takes, VIRTIO_HEADER};
 
 pub use interface::Interface;
 
-use super::unix::transport::{Each, Facts, Gathered, Sink, Source};
+use super::unix::transport::{Facts, Sink, Source};
 use super::unix::{Queue, copy_name, index_of, read_name, set_nonblocking};
 use crate::device::{Offload, Options};
 
@@ -38,6 +43,7 @@ pub struct Tunnel {
     offload: Offload,
     packet_information: bool,
     udp_max_segments: usize,
+    uring: bool,
 }
 
 impl Facts for Tunnel {
@@ -56,8 +62,8 @@ impl Facts for Tunnel {
 }
 
 impl super::Tunnel for Tunnel {
-    type Source = Source<Tunnel, Each>;
-    type Sink = Sink<Tunnel, Gathered>;
+    type Source = Source<Tunnel, uring::Reads>;
+    type Sink = Sink<Tunnel, uring::Writes>;
 
     fn create(options: &Options) -> Result<Tunnel> {
         let probe = open_tun()?;
@@ -104,6 +110,7 @@ impl super::Tunnel for Tunnel {
             offload,
             packet_information: options.packet_information,
             udp_max_segments: udp_max_segments(),
+            uring: uring::choose(options)?,
         })
     }
 
@@ -112,11 +119,13 @@ impl super::Tunnel for Tunnel {
     }
 
     fn source(self: &Arc<Tunnel>, queue: usize, frames: usize) -> Result<Self::Source> {
-        Ok(Source::new(self.clone(), &self.queue(queue)?, Each, frames))
+        let reads = uring::Reads::new(self.uring, frames)?;
+        Ok(Source::new(self.clone(), &self.queue(queue)?, reads, frames))
     }
 
     fn sink(self: &Arc<Tunnel>, queue: usize) -> Result<Self::Sink> {
-        Ok(Sink::new(self.clone(), &self.queue(queue)?, Gathered::default()))
+        let writes = uring::Writes::new(self.uring)?;
+        Ok(Sink::new(self.clone(), &self.queue(queue)?, writes))
     }
 
     fn interface(&self) -> &Interface {
@@ -199,6 +208,7 @@ impl super::Adopt for Tunnel {
             offload,
             packet_information: flags & libc::IFF_NO_PI == 0,
             udp_max_segments: udp_max_segments(),
+            uring: uring::usable(),
         })
     }
 }
@@ -321,7 +331,7 @@ fn negotiate(fd: RawFd) -> Result<Offload> {
 }
 
 /// The kernel release as major and minor number.
-fn kernel_version() -> (u32, u32) {
+pub(crate) fn kernel_version() -> (u32, u32) {
     // SAFETY: `utsname` is plain old data that `uname` fills in.
     let mut name: libc::utsname = unsafe { std::mem::zeroed() };
     // SAFETY: `name` is writable.

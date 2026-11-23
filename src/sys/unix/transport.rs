@@ -127,33 +127,45 @@ impl<T: Facts, W: Write> crate::io::Sink for Sink<T, W> {
 pub struct Each;
 
 impl Read for Each {
-    /// Reads until the device is empty, every slot is filled or the batch has its bytes.
-    fn read(&mut self, fd: RawFd, buffer: &mut [u8], frames: usize, stats: &mut ReaderStats, mut frame: impl FnMut(&mut [u8])) -> Filled {
-        let (mut slot, mut bytes) = (0, 0);
-        while slot < frames && bytes < BATCH_BYTES {
-            let room = &mut buffer[slot * SLOT..(slot + 1) * SLOT];
-            // SAFETY: `room` is writable for its whole length.
-            let read = unsafe { libc::read(fd, room.as_mut_ptr().cast(), room.len()) };
-            stats.calls += 1;
-            if read > 0 {
-                frame(&mut room[..read as usize]);
-                bytes += read as usize;
-                slot += 1;
-                continue;
-            }
-            let error = if read == 0 { nothing() } else { io::Error::last_os_error() };
-            match error.kind() {
-                ErrorKind::WouldBlock => return Filled::dry(),
-                ErrorKind::Interrupted => continue,
-                _ => return Filled::failed(error),
-            }
-        }
-        Filled::more()
+    fn read(&mut self, fd: RawFd, buffer: &mut [u8], frames: usize, stats: &mut ReaderStats, frame: impl FnMut(&mut [u8])) -> Filled {
+        read_each(fd, buffer, 0, frames, stats, frame).0
     }
 }
 
+/// Reads a frame per call into the slots from `first` on, until the device is empty, slot
+/// `frames` is reached or the batch has its bytes. Also returns how many frames it read.
+pub(crate) fn read_each(
+    fd: RawFd,
+    buffer: &mut [u8],
+    first: usize,
+    frames: usize,
+    stats: &mut ReaderStats,
+    mut frame: impl FnMut(&mut [u8]),
+) -> (Filled, usize) {
+    let (mut slot, mut bytes) = (first, 0);
+    while slot < frames && bytes < BATCH_BYTES {
+        let room = &mut buffer[slot * SLOT..(slot + 1) * SLOT];
+        // SAFETY: `room` is writable for its whole length.
+        let read = unsafe { libc::read(fd, room.as_mut_ptr().cast(), room.len()) };
+        stats.calls += 1;
+        if read > 0 {
+            frame(&mut room[..read as usize]);
+            bytes += read as usize;
+            slot += 1;
+            continue;
+        }
+        let error = if read == 0 { nothing() } else { io::Error::last_os_error() };
+        match error.kind() {
+            ErrorKind::WouldBlock => return (Filled::dry(), slot - first),
+            ErrorKind::Interrupted => continue,
+            _ => return (Filled::failed(error), slot - first),
+        }
+    }
+    (Filled::more(), slot - first)
+}
+
 /// A read that came back with nothing: these devices hand over whole frames or fail.
-fn nothing() -> io::Error {
+pub(crate) fn nothing() -> io::Error {
     io::Error::new(ErrorKind::UnexpectedEof, "the device returned nothing")
 }
 

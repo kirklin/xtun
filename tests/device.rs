@@ -23,6 +23,9 @@ fn ip(text: &str) -> IpAddr {
     text.parse().unwrap()
 }
 
+/// Whether the library reads and writes through io_uring here: Android does not let it.
+const URING: bool = cfg!(target_os = "linux");
+
 /// A builder for a device named per test.
 fn builder(name: &str) -> Builder {
     Tun::builder().name(name)
@@ -36,6 +39,17 @@ fn ends(mut queues: Vec<Queue>) -> (Reader, Writer) {
 
 fn with_queues(builder: Builder, queues: usize) -> Builder {
     builder.queues(queues)
+}
+
+#[cfg(target_os = "linux")]
+fn uring(builder: Builder, on: bool) -> Builder {
+    builder.uring(if on { xtun::Uring::Required } else { xtun::Uring::Off })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn uring(builder: Builder, on: bool) -> Builder {
+    assert!(!on, "only Linux has io_uring");
+    builder
 }
 
 fn exists(name: &str) -> bool {
@@ -69,8 +83,9 @@ async fn configures_the_interface() {
     assert!(!exists(&name), "the interface is gone with its last handle");
 }
 
-async fn udp_round_trip(offload: bool) {
-    let (_device, queues) = builder("xtuntest1").address(net("10.72.0.1/24")).address(net("fd72::1/64")).offload(offload).build().unwrap();
+async fn udp_round_trip(offload: bool, on: bool) {
+    let builder = builder("xtuntest1").address(net("10.72.0.1/24")).address(net("fd72::1/64")).offload(offload);
+    let (_device, queues) = uring(builder, on).build().unwrap();
     let (mut reader, mut writer) = ends(queues);
     for (local, remote) in [("10.72.0.1", "10.72.0.2"), ("fd72::1", "fd72::2")] {
         let socket = UdpSocket::bind(SocketAddr::new(ip(local), 0)).await.unwrap();
@@ -108,22 +123,31 @@ async fn udp_round_trip(offload: bool) {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "creates interfaces: run as root with --ignored"]
 async fn udp_round_trip_plain() {
-    udp_round_trip(false).await;
+    udp_round_trip(false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "creates interfaces: run as root with --ignored"]
 async fn udp_round_trip_offload() {
-    udp_round_trip(true).await;
+    udp_round_trip(true, false).await;
 }
 
-async fn through_reflector(offload: bool, mode: Mode, v6: bool, queues: usize) {
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "creates interfaces: run as root with --ignored"]
+async fn udp_round_trip_uring() {
+    udp_round_trip(true, true).await;
+    udp_round_trip(false, true).await;
+}
+
+async fn through_reflector(offload: bool, mode: Mode, v6: bool, queues: usize, on: bool) {
     let (local, peer, other, subnet) = if v6 {
         ("fd73::1", "fd73::2", "fd73::3", "fd73::1/64")
     } else {
         ("10.73.0.1", "10.73.0.2", "10.73.0.3", "10.73.0.1/24")
     };
-    let (_device, handed) = with_queues(builder("xtuntest2").address(net(subnet)).offload(offload), queues).build().unwrap();
+    let builder = with_queues(builder("xtuntest2").address(net(subnet)).offload(offload), queues);
+    let (_device, handed) = uring(builder, on).build().unwrap();
     assert_eq!(handed.len(), queues);
     let nat = Nat { local: ip(local), peer: ip(peer), other: ip(other), link: 0 };
     let counters = Arc::new(Counters::default());
@@ -154,8 +178,11 @@ async fn through_reflector(offload: bool, mode: Mode, v6: bool, queues: usize) {
 #[ignore = "creates interfaces: run as root with --ignored"]
 async fn tcp_one_packet_at_a_time() {
     for v6 in [false, true] {
-        through_reflector(false, Mode::Packets, v6, 1).await;
-        through_reflector(true, Mode::Packets, v6, 1).await;
+        through_reflector(false, Mode::Packets, v6, 1, false).await;
+        through_reflector(true, Mode::Packets, v6, 1, false).await;
+        if URING {
+            through_reflector(true, Mode::Packets, v6, 1, true).await;
+        }
     }
 }
 
@@ -283,25 +310,28 @@ async fn streams_and_sinks() {
 #[ignore = "creates interfaces: run as root with --ignored"]
 async fn tcp_through_the_device() {
     for v6 in [false, true] {
-        through_reflector(false, Mode::Pass, v6, 1).await;
-        through_reflector(false, Mode::Split, v6, 1).await;
+        through_reflector(false, Mode::Pass, v6, 1, false).await;
+        through_reflector(false, Mode::Split, v6, 1, false).await;
     }
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "creates interfaces: run as root with --ignored"]
 async fn tcp_through_the_device_with_offload() {
-    for v6 in [false, true] {
-        through_reflector(true, Mode::Pass, v6, 1).await;
-        through_reflector(true, Mode::Split, v6, 1).await;
+    let rings: &[bool] = if URING { &[false, true] } else { &[false] };
+    for &on in rings {
+        for v6 in [false, true] {
+            through_reflector(true, Mode::Pass, v6, 1, on).await;
+            through_reflector(true, Mode::Split, v6, 1, on).await;
+        }
     }
 }
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "creates interfaces: run as root with --ignored"]
 async fn tcp_through_four_queues() {
-    through_reflector(true, Mode::Split, false, 4).await;
-    through_reflector(true, Mode::Pass, true, 4).await;
+    through_reflector(true, Mode::Split, false, 4, false).await;
+    through_reflector(true, Mode::Pass, true, 4, URING).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -322,21 +352,24 @@ async fn a_device_hands_out_its_queues_once() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "creates interfaces: run as root with --ignored"]
 async fn a_deleted_interface_ends_the_reader() {
-    let (_device, queues) = builder("xtuntest4").address(net("10.75.0.1/24")).build().unwrap();
-    let (mut reader, _writer) = ends(queues);
-    // The kernel may send a packet of its own before the interface goes; only the error counts.
-    let waiting = tokio::spawn(async move {
-        loop {
-            if let Err(error) = reader.recv().await {
-                return error;
+    let rings: &[bool] = if URING { &[false, true] } else { &[false] };
+    for &on in rings {
+        let (_device, queues) = uring(builder("xtuntest4").address(net("10.75.0.1/24")), on).build().unwrap();
+        let (mut reader, _writer) = ends(queues);
+        // The kernel may send a packet of its own before the interface goes; only the error counts.
+        let waiting = tokio::spawn(async move {
+            loop {
+                if let Err(error) = reader.recv().await {
+                    return error;
+                }
             }
-        }
-    });
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let status = std::process::Command::new("ip").args(["link", "del", "xtuntest4"]).status().unwrap();
-    assert!(status.success());
-    let error = tokio::time::timeout(Duration::from_secs(2), waiting).await.expect("the reader wakes up").unwrap();
-    assert_eq!(error.raw_os_error(), Some(libc::EBADFD), "{error}");
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let status = std::process::Command::new("ip").args(["link", "del", "xtuntest4"]).status().unwrap();
+        assert!(status.success());
+        let error = tokio::time::timeout(Duration::from_secs(2), waiting).await.unwrap_or_else(|_| panic!("the reader wakes up, io_uring {on}")).unwrap();
+        assert_eq!(error.raw_os_error(), Some(libc::EBADFD), "{error}");
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
