@@ -319,6 +319,7 @@ pub fn pattern(offset: u64, out: &mut [u8]) {
 /// A segment sent after the interface is gone takes the default route, and some systems then
 /// keep a route to the address that outlives the test. Set while the connection is open: illumos
 /// takes no socket options once a direction is shut down.
+#[cfg(unix)]
 fn linger(stream: &TcpStream) {
     use std::os::fd::AsRawFd;
     // The Apple systems count `SO_LINGER` in clock ticks and take seconds as `SO_LINGER_SEC`.
@@ -338,6 +339,20 @@ fn linger(stream: &TcpStream) {
         )
     };
     assert_eq!(set, 0, "{}", io::Error::last_os_error());
+}
+
+/// [`linger`] for Windows sockets.
+#[cfg(windows)]
+fn linger(stream: &TcpStream) {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{LINGER, SO_LINGER, SOL_SOCKET, WSAGetLastError, setsockopt};
+    let linger = LINGER { l_onoff: 1, l_linger: 30 };
+    // SAFETY: the option reads a `LINGER`.
+    let set = unsafe {
+        setsockopt(stream.as_raw_socket() as usize, SOL_SOCKET, SO_LINGER, (&raw const linger).cast(), size_of::<LINGER>() as i32)
+    };
+    // SAFETY: reads the calling thread's last socket error.
+    assert_eq!(set, 0, "{}", io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
 }
 
 /// Closes `stream`, waiting as [`linger`] made it, on a thread of its own.
