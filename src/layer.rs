@@ -30,14 +30,14 @@ impl Layer for Ip {
 }
 
 /// Ethernet frames: the layer of a TAP interface.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ethernet {}
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 impl sealed::Sealed for Ethernet {}
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 impl Layer for Ethernet {
     type Tunnel = sys::Tap;
 

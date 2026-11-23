@@ -12,10 +12,20 @@ mod unix;
 #[cfg(unix)]
 pub(crate) use unix::{Signal, interrupted};
 
+#[cfg(target_vendor = "apple")]
+mod bsdlike;
+
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) mod linux;
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub use linux::{Interface, Tunnel as Tun, Tunnel as Tap};
+
+#[cfg(target_vendor = "apple")]
+pub(crate) mod darwin;
+#[cfg(target_os = "macos")]
+pub use darwin::Tap;
+#[cfg(target_vendor = "apple")]
+pub use darwin::{Interface, Tun};
 
 /// A device of one kind as a system has it: what creates the interface, opens its queues and
 /// keeps both alive. The interface behind it is configured through [`Tunnel::interface`]; what

@@ -42,17 +42,20 @@ pub(crate) enum Reactor {
 }
 
 impl Reactor {
-    /// Watches `fd` for readability and writability.
-    fn new(fd: RawFd) -> io::Result<Reactor> {
+    /// Watches `fd` for readability and, with `write`, writability.
+    fn new(fd: RawFd, write: bool) -> io::Result<Reactor> {
         #[cfg(feature = "tokio")]
         if tokio::runtime::Handle::try_current().is_ok() {
             use tokio::io::Interest;
+            let interest = if write { Interest::READABLE | Interest::WRITABLE } else { Interest::READABLE };
             // SAFETY: the queue keeps the descriptor open, and does not change what it refers
             // to, for as long as the reactor that holds the registration.
-            let fd = unsafe { tokio::io::unix::AsyncFd::register_with_interest(Watched(fd), Interest::READABLE | Interest::WRITABLE) }
+            let fd = unsafe { tokio::io::unix::AsyncFd::register_with_interest(Watched(fd), interest) }
                 .map_err(|error| error.into_parts().1)?;
             return Ok(Reactor::Tokio(fd));
         }
+        // async-io watches for readability or writability only while a task waits for it.
+        let _ = write;
         #[cfg(feature = "async-io")]
         return Ok(Reactor::AsyncIo(async_io::Async::new_nonblocking(Watched(fd))?));
         #[cfg(not(feature = "async-io"))]
@@ -114,11 +117,20 @@ impl Reactor {
 pub(crate) struct Queue {
     reactor: Mutex<Option<Arc<Reactor>>>,
     fd: OwnedFd,
+    /// The descriptor reports writability, so writers can wait for it.
+    writable: bool,
 }
 
 impl Queue {
     pub fn new(fd: OwnedFd) -> Queue {
-        Queue { reactor: Mutex::new(None), fd }
+        Queue { reactor: Mutex::new(None), fd, writable: true }
+    }
+
+    /// A queue whose descriptor reports only readability, such as a BPF device, whose writes
+    /// never wait.
+    #[cfg(target_os = "macos")]
+    pub fn read_only_readiness(fd: OwnedFd) -> Queue {
+        Queue { writable: false, ..Queue::new(fd) }
     }
 
     pub fn raw_fd(&self) -> RawFd {
@@ -137,7 +149,7 @@ impl Queue {
         if let Some(reactor) = &*slot {
             return Ok(reactor.clone());
         }
-        let reactor = Arc::new(Reactor::new(self.fd.as_raw_fd())?);
+        let reactor = Arc::new(Reactor::new(self.fd.as_raw_fd(), self.writable)?);
         *slot = Some(reactor.clone());
         Ok(reactor)
     }
@@ -209,25 +221,35 @@ impl Port {
     }
 }
 
-/// What an interrupt is made of: an eventfd, which turns readable once it is triggered.
+/// What an interrupt is made of: a descriptor that turns readable once it is triggered.
 pub struct Signal {
-    fd: OwnedFd,
+    read: OwnedFd,
+    /// The other end of a pipe; an eventfd is both ends.
+    write: Option<OwnedFd>,
     set: AtomicBool,
 }
 
 impl Signal {
     pub fn new() -> io::Result<Signal> {
-        // SAFETY: plain eventfd creation; the descriptor is owned right away.
-        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            // SAFETY: plain eventfd creation; the descriptor is owned right away.
+            let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // SAFETY: `fd` is new and owned by nobody else.
+            Ok(Signal { read: unsafe { OwnedFd::from_raw_fd(fd) }, write: None, set: AtomicBool::new(false) })
         }
-        // SAFETY: `fd` is new and owned by nobody else.
-        Ok(Signal { fd: unsafe { OwnedFd::from_raw_fd(fd) }, set: AtomicBool::new(false) })
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            let (read, write) = pipe()?;
+            Ok(Signal { read, write: Some(write), set: AtomicBool::new(false) })
+        }
     }
 
     pub fn fd(&self) -> RawFd {
-        self.fd.as_raw_fd()
+        self.read.as_raw_fd()
     }
 
     pub fn is_set(&self) -> bool {
@@ -239,8 +261,12 @@ impl Signal {
             return Ok(());
         }
         let one = 1u64.to_ne_bytes();
-        // SAFETY: `one` is readable for its length.
-        if unsafe { libc::write(self.fd.as_raw_fd(), one.as_ptr().cast(), one.len()) } < 0 {
+        let (fd, bytes) = match &self.write {
+            Some(write) => (write.as_raw_fd(), &one[..1]),
+            None => (self.read.as_raw_fd(), &one[..]),
+        };
+        // SAFETY: `bytes` is readable for its length.
+        if unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) } < 0 {
             self.set.store(false, Ordering::Release);
             return Err(io::Error::last_os_error());
         }
@@ -254,7 +280,7 @@ impl Signal {
         let mut sink = [0u8; 64];
         loop {
             // SAFETY: `sink` is writable for its length.
-            let read = unsafe { libc::read(self.fd.as_raw_fd(), sink.as_mut_ptr().cast(), sink.len()) };
+            let read = unsafe { libc::read(self.read.as_raw_fd(), sink.as_mut_ptr().cast(), sink.len()) };
             if read <= 0 {
                 let error = io::Error::last_os_error();
                 return match error.kind() {
@@ -266,6 +292,23 @@ impl Signal {
             }
         }
     }
+}
+
+/// Creates a pipe whose ends do not block and are closed on exec.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `fds` holds two descriptors.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: both descriptors are new and owned by nobody else.
+    let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    for fd in [&read, &write] {
+        set_nonblocking(fd.as_raw_fd())?;
+        set_cloexec(fd.as_raw_fd())?;
+    }
+    Ok((read, write))
 }
 
 /// Blocks until `fd` is ready for `events`, the interrupt is triggered or the deadline passes.
@@ -323,6 +366,18 @@ pub(crate) fn set_nonblocking(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub(crate) fn set_cloexec(fd: RawFd) -> io::Result<()> {
+    // SAFETY: F_GETFD and F_SETFD take and return plain integers.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 /// The index of the interface called `name`.
 pub(crate) fn index_of(name: &str) -> io::Result<u32> {
     let name = std::ffi::CString::new(name).map_err(|_| io::Error::new(ErrorKind::InvalidInput, "the name has a NUL byte"))?;
@@ -353,6 +408,20 @@ pub(crate) fn copy_name(name: &str, out: &mut [libc::c_char]) -> io::Result<()> 
 pub(crate) fn read_name(name: &[libc::c_char]) -> String {
     let bytes: Vec<u8> = name.iter().take_while(|byte| **byte != 0).map(|byte| byte.to_ne_bytes()[0]).collect();
     String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// A socket for interface ioctls.
+#[cfg(target_vendor = "apple")]
+pub(crate) fn control_socket(family: libc::c_int) -> io::Result<OwnedFd> {
+    // SAFETY: plain socket creation; the descriptor is owned right away.
+    let fd = unsafe { libc::socket(family, libc::SOCK_DGRAM, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a new descriptor nobody else owns.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    set_cloexec(fd.as_raw_fd())?;
+    Ok(fd)
 }
 
 #[cfg(test)]

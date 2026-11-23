@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use ipnet::IpNet;
 
 use crate::io::Queue;
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 use crate::layer::Ethernet;
 use crate::layer::{Ip, Layer};
 use crate::sys::{self, Tunnel};
@@ -28,8 +28,8 @@ pub struct Device<L: Layer = Ip> {
 /// A TUN interface: IP packets in and out.
 pub type Tun = Device<Ip>;
 
-/// A TAP interface: Ethernet frames in and out.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+/// A TAP interface: Ethernet frames in and out. On macOS it is a pair of `feth` interfaces.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 pub type Tap = Device<Ethernet>;
 
 /// What a device does with segments larger than the MTU.
@@ -110,6 +110,9 @@ pub struct Options {
     /// The group whose members may open a persistent interface.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub group: Option<u32>,
+    /// The name of the second `feth` interface of a TAP device.
+    #[cfg(target_os = "macos")]
+    pub peer_name: Option<String>,
 }
 
 /// Whether reads and writes on Linux go through io_uring, one system call for a whole batch.
@@ -153,6 +156,8 @@ impl<L: Layer> Default for Builder<L> {
                 owner: None,
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 group: None,
+                #[cfg(target_os = "macos")]
+                peer_name: None,
             },
             layer: PhantomData,
         }
@@ -172,7 +177,8 @@ impl<L: Layer> fmt::Debug for Builder<L> {
 }
 
 impl<L: Layer> Builder<L> {
-    /// The interface name. Left out, the system picks one.
+    /// The interface name. Left out, the system picks one. On macOS a TUN interface must be
+    /// called `utun` and a number, and a TAP interface `feth` and a number.
     pub fn name(mut self, name: impl Into<String>) -> Builder<L> {
         self.options.name = Some(name.into());
         self
@@ -196,8 +202,9 @@ impl<L: Layer> Builder<L> {
         self
     }
 
-    /// Whether the system hands over and takes TCP and UDP segments of up to 64 KiB. On by
-    /// default; packet information rules it out.
+    /// Whether the system hands over and takes TCP and UDP segments of up to 64 KiB, as Linux
+    /// does. On by default; other systems have no such offload, and packet information rules it
+    /// out.
     pub fn offload(mut self, offload: bool) -> Builder<L> {
         self.options.offload = offload;
         self
@@ -302,11 +309,29 @@ impl<L: Layer> Builder<L> {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(target_vendor = "apple")]
+impl Builder<Ip> {
+    /// Whether packets carry the address family, four bytes, in front. Packets are then read
+    /// and written as they are, without checksum work or segmentation.
+    pub fn packet_information(mut self, on: bool) -> Builder<Ip> {
+        self.options.packet_information = on;
+        self
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 impl Builder<Ethernet> {
     /// The hardware address. Left out, the system makes one up.
     pub fn mac_address(mut self, mac: [u8; 6]) -> Builder<Ethernet> {
         self.options.mac_address = Some(mac);
+        self
+    }
+
+    /// The name of the other `feth` interface of the pair, through which frames are read and
+    /// written. Left out, the system picks one.
+    #[cfg(target_os = "macos")]
+    pub fn peer_name(mut self, name: impl Into<String>) -> Builder<Ethernet> {
+        self.options.peer_name = Some(name.into());
         self
     }
 }
@@ -329,6 +354,7 @@ impl<L: Layer> Device<L> {
     }
 
     /// Renames the interface. Linux before 6.2 renames an interface only while it is down.
+    /// Fails with [`io::ErrorKind::Unsupported`] where interfaces keep their names.
     pub fn set_name(&self, name: &str) -> io::Result<()> {
         self.tunnel.set_name(name)
     }
@@ -428,7 +454,9 @@ impl<L: Layer> Device<L> {
         Ok(())
     }
 
-    /// The broadcast address of the interface's first IPv4 address, if it has one.
+    /// The broadcast address of the interface's first IPv4 address, if it has one. A
+    /// point-to-point interface of the Apple systems has none and fails with
+    /// [`io::ErrorKind::Unsupported`].
     pub fn broadcast(&self) -> io::Result<Option<Ipv4Addr>> {
         self.tunnel.interface().broadcast()
     }
@@ -475,7 +503,7 @@ fn peer_address(net: IpNet, peer: IpAddr) -> io::Result<Address> {
     Ok(Address { net, peer: Some(peer) })
 }
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 impl Device<Ethernet> {
     /// The hardware address.
     pub fn mac_address(&self) -> io::Result<[u8; 6]> {
@@ -494,9 +522,10 @@ where
     L::Tunnel: sys::Adopt,
 {
     /// Wraps an interface that something else created, such as the descriptor Android's
-    /// `VpnService` hands to an application, and hands it over with its one queue. Fails for a
-    /// descriptor of the other kind of interface. A descriptor with `IFF_VNET_HDR` gets the
-    /// offloads this library asks for.
+    /// `VpnService` or iOS's packet tunnel hands to an application, and hands it over with its
+    /// one queue. Fails for a descriptor of the other kind of interface. On Linux a descriptor
+    /// with `IFF_VNET_HDR` gets the offloads this library asks for. On the Apple systems packets
+    /// come without the address family in front.
     pub fn from_fd(fd: std::os::fd::OwnedFd) -> io::Result<(Device<L>, Queue<L>)> {
         let tunnel = Arc::new(<L::Tunnel as sys::Adopt>::adopt(fd, L::ETHERNET)?);
         let queue = Queue { tunnel: tunnel.clone(), index: 0 };
@@ -529,6 +558,27 @@ where
             Err(tunnel) => tunnel,
         };
         Err((Device { tunnel: tunnel.clone(), prefix_routes }, Queue { tunnel, index }))
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+impl Device<Ip> {
+    /// Wraps the utun interface that Network Extension opened for the packet tunnel provider
+    /// this process runs, without going through `NEPacketTunnelFlow`. The provider keeps its own
+    /// descriptor; the device holds a duplicate.
+    pub fn from_packet_tunnel() -> io::Result<(Device<Ip>, Queue<Ip>)> {
+        let tunnel = Arc::new(sys::Tun::packet_tunnel()?);
+        let queue = Queue { tunnel: tunnel.clone(), index: 0 };
+        Ok((Device { tunnel, prefix_routes: Arc::new(AtomicBool::new(true)) }, queue))
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+impl Device<Ip> {
+    /// Changes whether packets carry the address family in front, from the next read and write
+    /// on. These systems always have it in the kernel, so only the framing changes.
+    pub fn set_packet_information(&self, on: bool) -> io::Result<()> {
+        self.tunnel.set_packet_information(on)
     }
 }
 

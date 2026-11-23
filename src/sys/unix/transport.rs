@@ -19,6 +19,7 @@ pub const SLOT: usize = 65_536 + 128;
 
 /// A batch stops growing at this many bytes, so its first frame is written again while it is
 /// still in the cache and the flow's round trip does not stretch.
+#[cfg(not(target_vendor = "apple"))]
 pub const BATCH_BYTES: usize = 256 * 1024;
 
 /// What a device says about itself to the ends of its queues.
@@ -123,9 +124,11 @@ impl<T: Facts, W: Write> crate::io::Sink for Sink<T, W> {
 }
 
 /// Reads a frame per call, one into each slot: what every system can do.
+#[cfg(not(target_vendor = "apple"))]
 #[derive(Default)]
 pub struct Each;
 
+#[cfg(not(target_vendor = "apple"))]
 impl Read for Each {
     fn read(&mut self, fd: RawFd, buffer: &mut [u8], frames: usize, stats: &mut ReaderStats, frame: impl FnMut(&mut [u8])) -> Filled {
         read_each(fd, buffer, 0, frames, stats, frame).0
@@ -134,6 +137,7 @@ impl Read for Each {
 
 /// Reads a frame per call into the slots from `first` on, until the device is empty, slot
 /// `frames` is reached or the batch has its bytes. Also returns how many frames it read.
+#[cfg(not(target_vendor = "apple"))]
 pub(crate) fn read_each(
     fd: RawFd,
     buffer: &mut [u8],
@@ -165,6 +169,7 @@ pub(crate) fn read_each(
 }
 
 /// A read that came back with nothing: these devices hand over whole frames or fail.
+#[cfg(not(target_vendor = "apple"))]
 pub(crate) fn nothing() -> io::Error {
     io::Error::new(ErrorKind::UnexpectedEof, "the device returned nothing")
 }
@@ -201,11 +206,13 @@ impl IoVecs {
 }
 
 /// Writes a frame per call, its pieces gathered: what every system can do.
+#[cfg(not(target_vendor = "apple"))]
 #[derive(Default)]
 pub struct Gathered {
     iov: IoVecs,
 }
 
+#[cfg(not(target_vendor = "apple"))]
 impl Write for Gathered {
     fn write(&mut self, fd: RawFd, list: &impl Writes, stats: &mut WriterStats) -> io::Result<usize> {
         for index in 0..list.count() {
