@@ -1,0 +1,50 @@
+[package]
+name = "xtun-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+xtun-wire = { path = "../wire" }
+libfuzzer-sys = "0.4"
+
+[workspace]
+
+[[bin]]
+name = "checksum"
+path = "fuzz_targets/checksum.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frames"
+path = "fuzz_targets/frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "tun_hdr"
+path = "fuzz_targets/tun_hdr.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "joining"
+path = "fuzz_targets/joining.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "claims"
+path = "fuzz_targets/claims.rs"
+test = false
+doc = false
+bench = false
