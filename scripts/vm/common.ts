@@ -92,6 +92,16 @@ export function seedDisk(file: string, name: string, userData: string): void {
   });
 }
 
+/// The same NoCloud data on a FAT volume named `CIDATA`, a raw image; `file` ends in `.dmg`.
+/// For illumos, whose cloud-init compares the volume name with everything that follows it in
+/// its field: hdiutil fills the field of an ISO 9660 volume with zero bytes, a FAT volume has
+/// the spaces that cloud-init allows there.
+export function fatSeedDisk(file: string, name: string, userData: string): void {
+  seeded(file, name, userData, (staging) => {
+    must("hdiutil", ["create", "-quiet", "-srcfolder", staging, "-fs", "MS-DOS", "-volname", "CIDATA", "-layout", "NONE", "-format", "UDRW", "-o", file]);
+  });
+}
+
 /// Puts the NoCloud data into a directory, has `make` turn the directory into `file`, and
 /// removes the directory.
 function seeded(file: string, name: string, userData: string, make: (staging: string) => void): void {
@@ -106,7 +116,7 @@ function seeded(file: string, name: string, userData: string, make: (staging: st
 }
 
 export interface Machine {
-  arch: "aarch64";
+  arch: "aarch64" | "x86_64";
   /// The disk the machine boots from, a qcow2 image.
   disk: string;
   /// The port of the host that reaches the guest's SSH server.
@@ -135,14 +145,17 @@ function serial(machine: Machine): string[] {
   ];
 }
 
-/// Starts a machine on the host's processor.
+/// Starts a machine. An aarch64 guest runs on the host's processor; an x86_64 guest is emulated.
 export function boot(machine: Machine): ChildProcess {
   // QEMU cannot forward a port that is taken, and the wait for SSH would then talk to whatever
   // has it.
   if (run("nc", ["-z", "127.0.0.1", String(machine.port)]).code === 0) {
     throw new Error(`something already listens on port ${machine.port} of this host`);
   }
-  const platform = ["-machine", "virt", "-accel", "hvf", "-cpu", "host", "-bios", `${firmware}/edk2-aarch64-code.fd`];
+  const platform =
+    machine.arch === "aarch64"
+      ? ["-machine", "virt", "-accel", "hvf", "-cpu", "host", "-bios", `${firmware}/edk2-aarch64-code.fd`]
+      : ["-machine", "q35", "-accel", "tcg,thread=multi", "-cpu", "max"];
   const args = [
     ...platform,
     "-m", String(machine.memory ?? 4096),

@@ -8,7 +8,8 @@
     target_os = "ios",
     target_os = "freebsd",
     target_os = "netbsd",
-    target_os = "openbsd"
+    target_os = "openbsd",
+    target_os = "illumos"
 ))]
 
 mod common;
@@ -697,7 +698,12 @@ fn hands_over_its_descriptor() {
     assert_eq!(queue.index(), 0);
     drop(handle);
     let fd = device.into_fd(queue).unwrap();
-    let (device, queue) = Tun::from_fd(fd).unwrap();
+    let (device, queue) = match Tun::from_fd(fd) {
+        Ok(adopted) => adopted,
+        // The tun driver OmniOS ships is older than the request that tells a descriptor's unit.
+        Err(error) if cfg!(target_os = "illumos") && error.kind() == io::ErrorKind::Unsupported => return,
+        Err(error) => panic!("{error}"),
+    };
     assert_eq!(device.name().unwrap(), name);
     let (mut reader, _writer) = queue.split().unwrap();
     sent_through(&mut reader, "10.90.0.1", "10.90.0.2", b"through the handed over descriptor");
@@ -705,6 +711,7 @@ fn hands_over_its_descriptor() {
     device.set_persist(false).unwrap();
 }
 
+#[cfg(not(target_os = "illumos"))]
 #[test]
 #[ignore = "creates interfaces: run as root with --ignored"]
 fn frames_with_packet_information() {

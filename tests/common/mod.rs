@@ -317,7 +317,8 @@ pub fn pattern(offset: u64, out: &mut [u8]) {
 /// Makes closing `stream` wait until the peer has acknowledged everything this side sent, its FIN
 /// included, so that no segment of the connection is still on its way when the reflector stops.
 /// A segment sent after the interface is gone takes the default route, and some systems then
-/// keep a route to the address that outlives the test.
+/// keep a route to the address that outlives the test. Set while the connection is open: illumos
+/// takes no socket options once a direction is shut down.
 fn linger(stream: &TcpStream) {
     use std::os::fd::AsRawFd;
     // The Apple systems count `SO_LINGER` in clock ticks and take seconds as `SO_LINGER_SEC`.
