@@ -320,13 +320,18 @@ pub fn pattern(offset: u64, out: &mut [u8]) {
 /// keep a route to the address that outlives the test.
 fn linger(stream: &TcpStream) {
     use std::os::fd::AsRawFd;
+    // The Apple systems count `SO_LINGER` in clock ticks and take seconds as `SO_LINGER_SEC`.
+    #[cfg(target_vendor = "apple")]
+    let option = libc::SO_LINGER_SEC;
+    #[cfg(not(target_vendor = "apple"))]
+    let option = libc::SO_LINGER;
     let linger = libc::linger { l_onoff: 1, l_linger: 30 };
     // SAFETY: the option reads a `linger`.
     let set = unsafe {
         libc::setsockopt(
             stream.as_raw_fd(),
             libc::SOL_SOCKET,
-            libc::SO_LINGER,
+            option,
             (&raw const linger).cast(),
             size_of::<libc::linger>() as libc::socklen_t,
         )

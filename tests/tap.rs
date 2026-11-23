@@ -1,8 +1,8 @@
-//! Tests on real layer 2 interfaces. They need the privilege to create interfaces and are
-//! ignored by default: `cargo test -- --ignored --test-threads=1` as root, or
-//! `node scripts/linux.ts`.
+//! Tests on real layer 2 interfaces: TAP interfaces on Linux, pairs of `feth` interfaces on
+//! macOS. They need the privilege to create interfaces and are ignored by default:
+//! `cargo test -- --ignored --test-threads=1` as root, or `node scripts/linux.ts`.
 
-#![cfg(any(target_os = "linux", target_os = "android"))]
+#![cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 
 mod common;
 
@@ -15,6 +15,9 @@ use common::{Build, Counters, Mode, NEIGHBOR_MAC, Nat, ethernet, ip_packet, refl
 use xtun::{Builder, Checksum, Ethernet, Packet, Queue, Reader, Tap, Writer};
 use ipnet::IpNet;
 use tokio::net::UdpSocket;
+
+/// Whether the system is Linux, which Android is too.
+const LINUX: bool = cfg!(any(target_os = "linux", target_os = "android"));
 
 /// The hardware address of the system's side of every device.
 const DEVICE_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 0x01];
@@ -33,9 +36,10 @@ fn exists(name: &str) -> bool {
     unsafe { libc::if_nametoindex(name.as_ptr()) != 0 }
 }
 
-/// A layer 2 device named per test.
+/// A layer 2 device named per test on Linux; macOS numbers its `feth` interfaces itself.
 fn builder(name: &str) -> Builder<Ethernet> {
-    Tap::builder().mac_address(DEVICE_MAC).name(name)
+    let builder = Tap::builder().mac_address(DEVICE_MAC);
+    if LINUX { builder.name(name) } else { builder }
 }
 
 /// Both ends of the only queue of a device.
@@ -49,10 +53,16 @@ fn ends(mut queues: Vec<Queue<Ethernet>>) -> (Reader<Ethernet>, Writer<Ethernet>
 fn neighbors(device: &Tap, addresses: &[&str]) {
     let name = device.name().unwrap();
     for address in addresses {
-        let output = Command::new("ip")
-            .args(["neigh", "replace", address, "lladdr", "02:00:00:00:00:02", "nud", "permanent", "dev", &name])
-            .output()
-            .unwrap();
+        let output = if LINUX {
+            Command::new("ip")
+                .args(["neigh", "replace", address, "lladdr", "02:00:00:00:00:02", "nud", "permanent", "dev", &name])
+                .output()
+        } else if address.contains(':') {
+            Command::new("ndp").args(["-s", address, "2:0:0:0:0:2"]).output()
+        } else {
+            Command::new("arp").args(["-s", address, "2:0:0:0:0:2"]).output()
+        };
+        let output = output.unwrap();
         assert!(
             output.status.success(),
             "adding the neighbor {address}: {}{}\nroutes:\n{}",
@@ -60,12 +70,30 @@ fn neighbors(device: &Tap, addresses: &[&str]) {
             String::from_utf8_lossy(&output.stderr),
             routes(),
         );
+        // On macOS `ndp -s` looks the address up before it adds the entry, and the lookup leaves
+        // an unresolved entry scoped to the interface beside the one that is added. The system
+        // finds the scoped one first and asks the link for the address until it gives up.
+        if cfg!(target_os = "macos") && address.contains(':') {
+            let output = Command::new("route").args(["-n", "delete", "-inet6", "-ifscope", &name, address]).output().unwrap();
+            assert!(
+                output.status.success(),
+                "removing the unresolved neighbor {address}: {}{}\nroutes:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+                routes(),
+            );
+        }
     }
 }
 
 /// The system's IPv4 and IPv6 routes, neighbors included, for a failure message.
 fn routes() -> String {
-    shown("sh", &["-c", "ip route; ip -6 route; ip neigh"])
+    let output = if LINUX {
+        Command::new("sh").args(["-c", "ip route; ip -6 route; ip neigh"]).output()
+    } else {
+        Command::new("netstat").args(["-rn"]).output()
+    };
+    output.map_or_else(|error| error.to_string(), |output| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// What a frame carries, for a failure message: its EtherType, IP protocol, ICMPv6 type and
@@ -98,13 +126,22 @@ fn shown(program: &str, args: &[&str]) -> String {
 
 /// The system's table of IPv6 neighbors, for a failure message.
 fn neighbor_table() -> String {
-    shown("ip", &["-6", "neigh"])
+    if LINUX { shown("ip", &["-6", "neigh"]) } else { shown("ndp", &["-an"]) }
 }
 
-/// How the system would send to `address`, and the state of the device's interface, for a
-/// failure message.
+/// How the system would send to `address`, by any interface and bound to the device's own, and
+/// the state of the device's interface, for a failure message.
 fn way_to(address: &str, name: &str) -> String {
-    format!("{}{}", shown("ip", &["route", "get", address]), shown("ip", &["addr", "show", "dev", name]))
+    if LINUX {
+        return format!("{}{}", shown("ip", &["route", "get", address]), shown("ip", &["addr", "show", "dev", name]));
+    }
+    let family = if address.contains(':') { "-inet6" } else { "-inet" };
+    format!(
+        "route get:\n{}route get, bound to {name}:\n{}{}",
+        shown("route", &["-n", "get", family, address]),
+        shown("route", &["-n", "get", family, "-ifscope", name, address]),
+        shown("ifconfig", &[name]),
+    )
 }
 
 async fn udp_round_trip(name: &str, offload: bool) {
@@ -161,6 +198,7 @@ async fn udp_round_trip_plain() {
     udp_round_trip("xtuntap0", false).await;
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "creates interfaces: run as root with --ignored"]
 async fn udp_round_trip_offload() {
@@ -183,7 +221,7 @@ async fn through_reflector(offload: bool, mode: Mode, v6: bool) {
     stop(vec![task]).await;
     let (segments, packets, writes) = counters.get();
     println!("offload {offload} {mode:?} v6 {v6}: {segments} segments read, {packets} packets in {writes} writes");
-    if offload {
+    if offload && cfg!(any(target_os = "linux", target_os = "android")) {
         if mode != Mode::Packets {
             assert!(segments > 0, "the kernel hands over segments of Ethernet frames");
         }
@@ -207,6 +245,7 @@ async fn tcp_through_frames() {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "creates interfaces: run as root with --ignored"]
 async fn tcp_through_frames_with_offload() {

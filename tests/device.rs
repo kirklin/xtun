@@ -1,7 +1,12 @@
 //! Tests on real interfaces. They need the privilege to create interfaces and are ignored by
 //! default: `cargo test -- --ignored --test-threads=1` as root, or `node scripts/linux.ts`.
 
-#![cfg(any(target_os = "linux", target_os = "android"))]
+#![cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
 
 mod common;
 
@@ -23,12 +28,15 @@ fn ip(text: &str) -> IpAddr {
     text.parse().unwrap()
 }
 
+/// Whether the system is Linux, which Android is too.
+const LINUX: bool = cfg!(any(target_os = "linux", target_os = "android"));
 /// Whether the library reads and writes through io_uring here: Android does not let it.
 const URING: bool = cfg!(target_os = "linux");
 
-/// A builder for a device named per test.
+/// A builder for a device named per test on Linux; macOS picks utun names itself.
 fn builder(name: &str) -> Builder {
-    Tun::builder().name(name)
+    let builder = Tun::builder();
+    if LINUX { builder.name(name) } else { builder }
 }
 
 /// Both ends of the only queue of a device.
@@ -37,8 +45,15 @@ fn ends(mut queues: Vec<Queue>) -> (Reader, Writer) {
     queues.remove(0).split().unwrap()
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn with_queues(builder: Builder, queues: usize) -> Builder {
     builder.queues(queues)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn with_queues(builder: Builder, queues: usize) -> Builder {
+    assert_eq!(queues, 1, "only Linux has more than one queue");
+    builder
 }
 
 #[cfg(target_os = "linux")]
@@ -106,7 +121,7 @@ async fn udp_round_trip(offload: bool, on: bool) {
         };
         let header = if data[0] >> 4 == 6 { 40 } else { 20 };
         assert_eq!(&data[header + 8..], b"hello through the device");
-        if offload {
+        if offload && cfg!(any(target_os = "linux", target_os = "android")) {
             assert!(matches!(checksum, Checksum::Partial { .. }), "{checksum:?}");
         }
         let reply = Build { src: ip(remote), dst: ip(local), src_port: 9, dst_port: port, ttl: 64, id: 1 }.udp(b"and back");
@@ -126,6 +141,7 @@ async fn udp_round_trip_plain() {
     udp_round_trip(false, false).await;
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "creates interfaces: run as root with --ignored"]
 async fn udp_round_trip_offload() {
@@ -160,7 +176,7 @@ async fn through_reflector(offload: bool, mode: Mode, v6: bool, queues: usize, o
     stop(tasks).await;
     let (segments, packets, writes) = counters.get();
     println!("offload {offload} {mode:?} v6 {v6} queues {queues}: {segments} segments read, {packets} packets in {writes} writes");
-    if offload {
+    if offload && cfg!(any(target_os = "linux", target_os = "android")) {
         if mode != Mode::Packets {
             assert!(segments > 0, "the kernel hands over segments");
         }
@@ -179,7 +195,9 @@ async fn through_reflector(offload: bool, mode: Mode, v6: bool, queues: usize, o
 async fn tcp_one_packet_at_a_time() {
     for v6 in [false, true] {
         through_reflector(false, Mode::Packets, v6, 1, false).await;
-        through_reflector(true, Mode::Packets, v6, 1, false).await;
+        if LINUX {
+            through_reflector(true, Mode::Packets, v6, 1, false).await;
+        }
         if URING {
             through_reflector(true, Mode::Packets, v6, 1, true).await;
         }
@@ -315,6 +333,7 @@ async fn tcp_through_the_device() {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "creates interfaces: run as root with --ignored"]
 async fn tcp_through_the_device_with_offload() {
@@ -327,6 +346,7 @@ async fn tcp_through_the_device_with_offload() {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "creates interfaces: run as root with --ignored"]
 async fn tcp_through_four_queues() {
@@ -349,6 +369,7 @@ async fn a_device_hands_out_its_queues_once() {
     assert_eq!(refused.kind(), io::ErrorKind::InvalidInput, "a batch holds at least one frame");
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "creates interfaces: run as root with --ignored"]
 async fn a_deleted_interface_ends_the_reader() {
@@ -372,6 +393,7 @@ async fn a_deleted_interface_ends_the_reader() {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "creates interfaces: run as root with --ignored"]
 async fn large_packets_without_offload() {
@@ -389,6 +411,7 @@ async fn large_packets_without_offload() {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "creates interfaces: run as root with --ignored"]
 async fn adopts_a_descriptor() {
@@ -437,8 +460,15 @@ fn run(program: &str, args: &[&str]) -> String {
 
 /// The interface through which the system sends packets for `ip`.
 fn route_device(ip: &str) -> String {
-    let shown = run("ip", &["route", "get", ip]);
-    shown.split_whitespace().skip_while(|word| *word != "dev").nth(1).unwrap_or_default().to_owned()
+    if LINUX {
+        let shown = run("ip", &["route", "get", ip]);
+        shown.split_whitespace().skip_while(|word| *word != "dev").nth(1).unwrap_or_default().to_owned()
+    } else {
+        // Without the family, `route` takes an IPv6 address for a host name to look up.
+        let family = if ip.contains(':') { "-inet6" } else { "-inet" };
+        let shown = run("route", &["-n", "get", family, ip]);
+        shown.lines().find_map(|line| line.trim().strip_prefix("interface: ")).unwrap_or_default().to_owned()
+    }
 }
 
 /// Waits up to two seconds for `condition`, which the kernel may make true a moment later.
@@ -461,6 +491,7 @@ fn sent_through(reader: &mut xtun::Reader, from: &str, to: &str, text: &[u8]) ->
     blocking_packet(reader, text)
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 #[ignore = "creates interfaces: run as root with --ignored"]
 fn renames_and_brings_up_and_down() {
@@ -491,6 +522,21 @@ fn renames_and_brings_up_and_down() {
     assert!(!device.is_running().unwrap());
 }
 
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+#[test]
+#[ignore = "creates interfaces: run as root with --ignored"]
+fn brings_up_and_down() {
+    let (device, _queues) = builder("xtuntest10").address(net("10.96.0.1/24")).up(false).build().unwrap();
+    assert!(!device.is_up().unwrap());
+    device.set_up(true).unwrap();
+    assert!(device.is_up().unwrap());
+    assert!(eventually(|| device.is_running().unwrap()));
+    device.set_up(false).unwrap();
+    assert!(!device.is_up().unwrap());
+    assert_eq!(device.set_name("xtun7").unwrap_err().kind(), io::ErrorKind::Unsupported, "a utun interface keeps its name");
+    assert_eq!(device.set_persist(true).unwrap_err().kind(), io::ErrorKind::Unsupported, "a utun interface goes with its socket");
+}
+
 #[test]
 #[ignore = "creates interfaces: run as root with --ignored"]
 fn point_to_point_addresses() {
@@ -499,8 +545,10 @@ fn point_to_point_addresses() {
     let addresses = device.addresses().unwrap();
     assert!(addresses.contains(&net("10.83.0.1/32")), "{addresses:?}");
     assert!(addresses.contains(&net("fd83::1/128")), "{addresses:?}");
-    let shown = run("ip", &["addr", "show", "dev", "xtuntest12"]);
-    assert!(shown.contains("peer 10.83.0.2/32") && shown.contains("peer fd83::2/128"), "{shown}");
+    if LINUX {
+        let shown = run("ip", &["addr", "show", "dev", "xtuntest12"]);
+        assert!(shown.contains("peer 10.83.0.2/32") && shown.contains("peer fd83::2/128"), "{shown}");
+    }
     let (mut reader, _writer) = ends(queues);
     let request = sent_through(&mut reader, "10.83.0.1", "10.83.0.2", b"to the far end");
     assert_eq!(&request[16..20], &[10, 83, 0, 2]);
@@ -514,16 +562,22 @@ fn point_to_point_addresses() {
 #[ignore = "creates interfaces: run as root with --ignored"]
 fn broadcast_and_one_address_per_version() {
     let (device, _queues) = builder("xtuntest13").address(net("10.84.0.1/24")).address(net("fd84::1/64")).build().unwrap();
-    assert_eq!(device.broadcast().unwrap(), Some("10.84.0.255".parse().unwrap()));
-    device.set_broadcast("10.84.0.254".parse().unwrap()).unwrap();
-    assert_eq!(device.broadcast().unwrap(), Some("10.84.0.254".parse().unwrap()));
+    if LINUX {
+        assert_eq!(device.broadcast().unwrap(), Some("10.84.0.255".parse().unwrap()));
+        device.set_broadcast("10.84.0.254".parse().unwrap()).unwrap();
+        assert_eq!(device.broadcast().unwrap(), Some("10.84.0.254".parse().unwrap()));
+    } else {
+        assert_eq!(device.broadcast().unwrap_err().kind(), io::ErrorKind::Unsupported, "a utun interface is point to point");
+    }
     device.add_address(net("10.84.1.1/24")).unwrap();
     device.set_address(net("10.84.2.1/24")).unwrap();
     let addresses = device.addresses().unwrap();
     let v4: Vec<_> = addresses.iter().filter(|net| net.addr().is_ipv4()).collect();
     assert_eq!(v4, [&net("10.84.2.1/24")], "{addresses:?}");
     assert!(addresses.contains(&net("fd84::1/64")), "the other IP version keeps its address: {addresses:?}");
-    assert_eq!(device.broadcast().unwrap(), Some("10.84.2.255".parse().unwrap()));
+    if LINUX {
+        assert_eq!(device.broadcast().unwrap(), Some("10.84.2.255".parse().unwrap()));
+    }
 }
 
 #[test]
@@ -538,8 +592,10 @@ fn routes_through_the_interface() {
     assert_eq!(route_device("10.86.1.1"), name);
     assert_eq!(route_device("10.87.1.1"), name);
     assert_eq!(route_device("fd86::1"), name);
-    let shown = run("ip", &["route", "show", "10.87.0.0/16"]);
-    assert!(shown.contains(&format!("via 10.85.0.2 dev {name}")), "{shown}");
+    if LINUX {
+        let shown = run("ip", &["route", "show", "10.87.0.0/16"]);
+        assert!(shown.contains(&format!("via 10.85.0.2 dev {name}")), "{shown}");
+    }
     let refused = device.add_route(net("10.86.0.0/16"), None).unwrap_err();
     assert_eq!(refused.kind(), io::ErrorKind::AlreadyExists, "{refused}");
     sent_through(&mut reader, "10.85.0.1", "10.86.1.1", b"routed");
@@ -562,6 +618,7 @@ fn routes_through_the_interface() {
     assert_eq!(route_device("10.88.1.2"), name);
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 #[ignore = "creates interfaces: run as root with --ignored"]
 fn queue_length_persistence_and_exclusive_names() {
@@ -580,6 +637,7 @@ fn queue_length_persistence_and_exclusive_names() {
     assert!(!exists("xtuntest15"));
 }
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
 #[test]
 #[ignore = "creates interfaces: run as root with --ignored"]
 fn owner_group_and_more_queues() {
@@ -596,6 +654,22 @@ fn owner_group_and_more_queues() {
     assert!(device.queue_fd(2).is_ok() && device.queue_fd(3).is_err());
     let (single, _queues) = builder("xtuntest17").build().unwrap();
     assert_eq!(single.add_queue().unwrap_err().kind(), io::ErrorKind::Unsupported);
+}
+
+/// A packet tunnel provider finds the utun interface that the system opened for its process
+/// among the process's descriptors. A process that made a utun interface itself has one too.
+#[cfg(target_vendor = "apple")]
+#[test]
+#[ignore = "creates interfaces: run as root with --ignored"]
+fn finds_the_utun_interface_of_the_process() {
+    let (device, queues) = builder("xtuntest20").address(net("10.92.0.1/24")).build().unwrap();
+    let name = device.name().unwrap();
+    let (found, queue) = Tun::from_packet_tunnel().unwrap();
+    assert_eq!(found.name().unwrap(), name);
+    drop((device, queues));
+    assert!(exists(&name), "the duplicate of the descriptor keeps the interface");
+    let (mut reader, _writer) = queue.split().unwrap();
+    sent_through(&mut reader, "10.92.0.1", "10.92.0.2", b"through the duplicate");
 }
 
 #[test]
@@ -622,8 +696,8 @@ fn frames_with_packet_information() {
     assert!(device.packet_information());
     assert!(!device.offload().tcp, "packet information rules out offloads");
     let (mut reader, mut writer) = ends(queues);
-    // Flags and the Ethernet protocol.
-    let information: [u8; 4] = [0, 0, 0x08, 0x00];
+    // Linux puts flags and the Ethernet protocol in front, the Apple systems the address family.
+    let information: [u8; 4] = if LINUX { [0, 0, 0x08, 0x00] } else { (libc::AF_INET as u32).to_be_bytes() };
     let socket = std::net::UdpSocket::bind("10.91.0.1:0").unwrap();
     socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let port = socket.local_addr().unwrap().port();
