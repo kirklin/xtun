@@ -14,7 +14,8 @@ use crate::io::Queue;
     target_os = "macos",
     target_os = "freebsd",
     target_os = "netbsd",
-    target_os = "openbsd"
+    target_os = "openbsd",
+    windows
 ))]
 use crate::layer::Ethernet;
 use crate::layer::{Ip, Layer};
@@ -35,16 +36,30 @@ pub struct Device<L: Layer = Ip> {
 /// A TUN interface: IP packets in and out.
 pub type Tun = Device<Ip>;
 
-/// A TAP interface: Ethernet frames in and out. On macOS it is a pair of `feth` interfaces.
+/// A TAP interface: Ethernet frames in and out. On Windows it is a TAP-Windows adapter, whose
+/// driver (tap-windows6) has to be installed; on macOS a pair of `feth` interfaces.
 #[cfg(any(
     target_os = "linux",
     target_os = "android",
     target_os = "macos",
     target_os = "freebsd",
     target_os = "netbsd",
-    target_os = "openbsd"
+    target_os = "openbsd",
+    windows
 ))]
 pub type Tap = Device<Ethernet>;
+
+/// How serious a message of Wintun's is.
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WintunLevel {
+    /// Something worth knowing.
+    Info,
+    /// Something went wrong and was worked around.
+    Warning,
+    /// Something failed.
+    Error,
+}
 
 /// What a device does with segments larger than the MTU.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -127,6 +142,9 @@ pub struct Options {
     /// The name of the second `feth` interface of a TAP device.
     #[cfg(target_os = "macos")]
     pub peer_name: Option<String>,
+    /// What only Windows has.
+    #[cfg(windows)]
+    pub windows: sys::WindowsOptions,
 }
 
 /// Whether reads and writes on Linux go through io_uring, one system call for a whole batch.
@@ -172,6 +190,8 @@ impl<L: Layer> Default for Builder<L> {
                 group: None,
                 #[cfg(target_os = "macos")]
                 peer_name: None,
+                #[cfg(windows)]
+                windows: sys::WindowsOptions::default(),
             },
             layer: PhantomData,
         }
@@ -340,7 +360,8 @@ impl Builder<Ip> {
     target_os = "macos",
     target_os = "freebsd",
     target_os = "netbsd",
-    target_os = "openbsd"
+    target_os = "openbsd",
+    windows
 ))]
 impl Builder<Ethernet> {
     /// The hardware address. Left out, the system makes one up.
@@ -354,6 +375,66 @@ impl Builder<Ethernet> {
     #[cfg(target_os = "macos")]
     pub fn peer_name(mut self, name: impl Into<String>) -> Builder<Ethernet> {
         self.options.peer_name = Some(name.into());
+        self
+    }
+}
+
+#[cfg(windows)]
+impl<L: Layer> Builder<L> {
+    /// The adapter's GUID. Left out, it is derived from the name, so that the same name gets the
+    /// same adapter identity and Windows keeps its network profile.
+    pub fn guid(mut self, guid: u128) -> Builder<L> {
+        self.options.windows.guid = Some(guid);
+        self
+    }
+
+    /// The MTU of IPv6, at least 1280, when it differs from IPv4's; [`Builder::mtu`] sets both.
+    pub fn mtu_v6(mut self, mtu: u32) -> Builder<L> {
+        self.options.windows.mtu_v6 = Some(mtu);
+        self
+    }
+
+    /// The interface metric of both IP versions. A low metric makes Windows prefer the
+    /// interface, its routes and its name servers.
+    pub fn metric(mut self, metric: u32) -> Builder<L> {
+        self.options.windows.metric = Some(metric);
+        self
+    }
+}
+
+#[cfg(windows)]
+impl Builder<Ip> {
+    /// Where `wintun.dll` is. Left out, it is looked for next to the program and in the system
+    /// directory.
+    pub fn wintun(mut self, path: impl Into<std::path::PathBuf>) -> Builder<Ip> {
+        self.options.windows.wintun = Some(path.into());
+        self
+    }
+
+    /// The size of each of Wintun's two rings, a power of two from 128 KiB to 64 MiB. 8 MiB by
+    /// default.
+    pub fn ring_capacity(mut self, bytes: u32) -> Builder<Ip> {
+        self.options.windows.ring_capacity = bytes;
+        self
+    }
+
+    /// The tunnel type shown for the adapter.
+    pub fn tunnel_type(mut self, tunnel_type: impl Into<String>) -> Builder<Ip> {
+        self.options.windows.tunnel_type = tunnel_type.into();
+        self
+    }
+
+    /// Whether the Wintun driver is removed from the system once the device is dropped and no
+    /// other adapter uses it. Off by default.
+    pub fn delete_driver(mut self, delete: bool) -> Builder<Ip> {
+        self.options.windows.delete_driver = delete;
+        self
+    }
+
+    /// Hands Wintun's own messages to `logger`, with their level and time. Wintun keeps one
+    /// logger for the whole process, which the last device built with one sets.
+    pub fn wintun_logger(mut self, logger: fn(WintunLevel, std::time::SystemTime, &str)) -> Builder<Ip> {
+        self.options.windows.logger = Some(logger);
         self
     }
 }
@@ -375,8 +456,9 @@ impl<L: Layer> Device<L> {
         self.tunnel.interface().name()
     }
 
-    /// Renames the interface. Linux before 6.2 renames an interface only while it is down.
-    /// Fails with [`io::ErrorKind::Unsupported`] where interfaces keep their names.
+    /// Renames the interface. Linux before 6.2 renames an interface only while it is down;
+    /// Windows renames the adapter. Fails with [`io::ErrorKind::Unsupported`] where interfaces
+    /// keep their names.
     pub fn set_name(&self, name: &str) -> io::Result<()> {
         self.tunnel.set_name(name)
     }
@@ -411,10 +493,13 @@ impl<L: Layer> Device<L> {
         self.tunnel.is_up()
     }
 
-    /// Brings the interface up or down. illumos keeps a flag for each address and brings up only
-    /// addresses: the device brings its addresses up and down with it. NetBSD and OpenBSD check
-    /// IPv6 addresses for duplicates on the link again when the interface comes up: the call
-    /// returns once they can be used, as [`Device::add_address`] does.
+    /// Brings the interface up or down. A Wintun adapter on Windows is up while a session runs
+    /// on it: bringing it down ends the session once the reader gives back the packets it holds,
+    /// and packets written meanwhile are lost. A TAP-Windows adapter is up while its medium is
+    /// connected. illumos keeps a flag for each address and brings up only addresses: the device
+    /// brings its addresses up and down with it. NetBSD and OpenBSD check IPv6 addresses for
+    /// duplicates on the link again when the interface comes up: the call returns once they can
+    /// be used, as [`Device::add_address`] does.
     pub fn set_up(&self, up: bool) -> io::Result<()> {
         self.tunnel.set_up(up)
     }
@@ -537,7 +622,8 @@ fn peer_address(net: IpNet, peer: IpAddr) -> io::Result<Address> {
     target_os = "macos",
     target_os = "freebsd",
     target_os = "netbsd",
-    target_os = "openbsd"
+    target_os = "openbsd",
+    windows
 ))]
 impl Device<Ethernet> {
     /// The hardware address.
@@ -545,7 +631,9 @@ impl Device<Ethernet> {
         self.tunnel.mac_address()
     }
 
-    /// Changes the hardware address.
+    /// Changes the hardware address. A TAP-Windows adapter takes its address only when it
+    /// starts, which restarts it under the open device: give it to [`Builder::mac_address`]
+    /// instead; here Windows fails with [`io::ErrorKind::Unsupported`].
     pub fn set_mac_address(&self, mac: [u8; 6]) -> io::Result<()> {
         self.tunnel.set_mac_address(mac)
     }
@@ -647,6 +735,48 @@ impl<L: Layer<Tunnel = sys::linux::Tunnel>> Device<L> {
     pub fn add_queue(&self) -> io::Result<Queue<L>> {
         let index = self.tunnel.add_queue()?;
         Ok(Queue { tunnel: self.tunnel.clone(), index })
+    }
+}
+
+#[cfg(windows)]
+impl<L: Layer> Device<L> {
+    /// The interface's locally unique identifier, which the IP Helper API takes.
+    pub fn luid(&self) -> u64 {
+        self.tunnel.interface().luid()
+    }
+
+    /// The MTU of IPv6, which Windows keeps apart from IPv4's.
+    pub fn mtu_v6(&self) -> io::Result<u32> {
+        self.tunnel.interface().mtu_v6()
+    }
+
+    /// Changes the MTU of IPv6 only, to at least 1280. [`Device::set_mtu`] changes both IP
+    /// versions, IPv6 only when the MTU is at least that.
+    pub fn set_mtu_v6(&self, mtu: u32) -> io::Result<()> {
+        self.tunnel.interface().set_mtu_v6(mtu)
+    }
+
+    /// The interface metric of IPv4.
+    pub fn metric(&self) -> io::Result<u32> {
+        self.tunnel.interface().metric()
+    }
+
+    /// Sets the interface metric of both IP versions. A low metric makes Windows prefer the
+    /// interface, its routes and its name servers.
+    pub fn set_metric(&self, metric: u32) -> io::Result<()> {
+        self.tunnel.interface().set_metric(metric)
+    }
+
+    /// The version of the running driver, Wintun or TAP-Windows, as `major.minor`.
+    pub fn driver_version(&self) -> io::Result<String> {
+        self.tunnel.driver_version()
+    }
+
+    /// Makes `servers` the interface's name servers, in order of preference: the IPv4 ones for
+    /// IPv4 and the IPv6 ones for IPv6. An IP version without servers in the list has none
+    /// configured afterwards, so an empty list clears both.
+    pub fn set_dns_servers(&self, servers: &[IpAddr]) -> io::Result<()> {
+        self.tunnel.interface().set_dns_servers(servers)
     }
 }
 

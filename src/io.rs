@@ -369,7 +369,8 @@ pub struct Writer<L: Layer = Ip> {
     stats: WriterStats,
 }
 
-/// The frames of one read. They live in the reader's buffers until the batch is dropped.
+/// The frames of one read. They live in the reader's buffers, or on Windows in the driver's,
+/// until the batch is dropped.
 pub struct Batch<'a> {
     source: &'a mut dyn Source,
     lent: &'a mut [Lent],

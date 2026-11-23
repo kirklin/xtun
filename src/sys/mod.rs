@@ -37,6 +37,13 @@ pub(crate) mod illumos;
 #[cfg(target_os = "illumos")]
 pub use illumos::{Interface, Tun};
 
+#[cfg(windows)]
+pub(crate) mod windows;
+#[cfg(windows)]
+pub use windows::{Interface, Tap, Tun};
+#[cfg(windows)]
+pub(crate) use windows::{Signal, WindowsOptions, interrupted};
+
 /// A device of one kind as a system has it: what creates the interface, opens its queues and
 /// keeps both alive. The interface behind it is configured through [`Tunnel::interface`]; what
 /// a kind of device does its own way overrides the methods that default to the interface.
@@ -139,6 +146,10 @@ pub trait Tunnel: Send + Sync + Sized + 'static {
     fn set_mac_address(&self, mac: [u8; 6]) -> io::Result<()> {
         self.interface().set_mac_address(mac)
     }
+
+    /// The version of the running driver.
+    #[cfg(windows)]
+    fn driver_version(&self) -> io::Result<String>;
 }
 
 /// A device whose queues are descriptors.

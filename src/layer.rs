@@ -36,7 +36,8 @@ impl Layer for Ip {
     target_os = "macos",
     target_os = "freebsd",
     target_os = "netbsd",
-    target_os = "openbsd"
+    target_os = "openbsd",
+    windows
 ))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Ethernet {}
@@ -47,7 +48,8 @@ pub enum Ethernet {}
     target_os = "macos",
     target_os = "freebsd",
     target_os = "netbsd",
-    target_os = "openbsd"
+    target_os = "openbsd",
+    windows
 ))]
 impl sealed::Sealed for Ethernet {}
 
@@ -57,7 +59,8 @@ impl sealed::Sealed for Ethernet {}
     target_os = "macos",
     target_os = "freebsd",
     target_os = "netbsd",
-    target_os = "openbsd"
+    target_os = "openbsd",
+    windows
 ))]
 impl Layer for Ethernet {
     type Tunnel = sys::Tap;

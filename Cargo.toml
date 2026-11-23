@@ -6,7 +6,7 @@ name = "xtun"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "TUN and TAP interfaces on Linux, Android, the Apple systems, FreeBSD, NetBSD, OpenBSD and illumos, with batched and offloaded packet I/O"
+description = "TUN and TAP interfaces on Linux, Android, the Apple systems, FreeBSD, NetBSD, OpenBSD, illumos and Windows, with batched and offloaded packet I/O"
 
 [features]
 default = ["tokio"]
@@ -36,6 +36,22 @@ io-uring = "0.7.16"
 netlink-packet-core = "0.9"
 netlink-packet-route = "0.34"
 netlink-sys = { version = "0.9", default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 async-io = "2.6"
