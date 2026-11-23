@@ -411,9 +411,10 @@ impl<L: Layer> Device<L> {
         self.tunnel.is_up()
     }
 
-    /// Brings the interface up or down. NetBSD and OpenBSD check IPv6 addresses for duplicates on
-    /// the link again when the interface comes up: the call returns once they can be used, as
-    /// [`Device::add_address`] does.
+    /// Brings the interface up or down. illumos keeps a flag for each address and brings up only
+    /// addresses: the device brings its addresses up and down with it. NetBSD and OpenBSD check
+    /// IPv6 addresses for duplicates on the link again when the interface comes up: the call
+    /// returns once they can be used, as [`Device::add_address`] does.
     pub fn set_up(&self, up: bool) -> io::Result<()> {
         self.tunnel.set_up(up)
     }

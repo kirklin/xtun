@@ -32,6 +32,11 @@ pub(crate) mod tuntap;
 #[cfg(any(target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
 pub use tuntap::{Interface, Tunnel as Tun, Tunnel as Tap};
 
+#[cfg(target_os = "illumos")]
+pub(crate) mod illumos;
+#[cfg(target_os = "illumos")]
+pub use illumos::{Interface, Tun};
+
 /// A device of one kind as a system has it: what creates the interface, opens its queues and
 /// keeps both alive. The interface behind it is configured through [`Tunnel::interface`]; what
 /// a kind of device does its own way overrides the methods that default to the interface.

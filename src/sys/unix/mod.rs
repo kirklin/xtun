@@ -411,7 +411,7 @@ pub(crate) fn read_name(name: &[libc::c_char]) -> String {
 }
 
 /// A socket for interface ioctls.
-#[cfg(any(target_vendor = "apple", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
+#[cfg(any(target_vendor = "apple", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd", target_os = "illumos"))]
 pub(crate) fn control_socket(family: libc::c_int) -> io::Result<OwnedFd> {
     // SAFETY: plain socket creation; the descriptor is owned right away.
     let fd = unsafe { libc::socket(family, libc::SOCK_DGRAM, 0) };
