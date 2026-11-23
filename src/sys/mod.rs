@@ -12,7 +12,7 @@ mod unix;
 #[cfg(unix)]
 pub(crate) use unix::{Signal, interrupted};
 
-#[cfg(target_vendor = "apple")]
+#[cfg(any(target_vendor = "apple", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
 mod bsdlike;
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -26,6 +26,11 @@ pub(crate) mod darwin;
 pub use darwin::Tap;
 #[cfg(target_vendor = "apple")]
 pub use darwin::{Interface, Tun};
+
+#[cfg(any(target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
+pub(crate) mod tuntap;
+#[cfg(any(target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
+pub use tuntap::{Interface, Tunnel as Tun, Tunnel as Tap};
 
 /// A device of one kind as a system has it: what creates the interface, opens its queues and
 /// keeps both alive. The interface behind it is configured through [`Tunnel::interface`]; what

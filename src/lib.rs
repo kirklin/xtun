@@ -1,13 +1,14 @@
 //! Virtual network interfaces with batched packet I/O.
 //!
-//! A [`Tun`] interface carries IP packets, on Linux, Android and the Apple systems; a [`Tap`]
-//! interface carries Ethernet frames, on Linux and macOS. Building one gives a handle to configure
-//! the interface and its [`Queue`]s; each queue splits, once, into a [`Reader`] and a [`Writer`].
-//! Frames are read and written a batch at a time or one packet at a time, asynchronously on Tokio
-//! or async-io, or blocking the thread. On Linux the system hands over TCP and UDP segments of up
-//! to 64 KiB at once and takes them back the same way; [`Frame::segments`] cuts such a segment
-//! into ordinary packets inside the buffer it was read into, and the writer joins consecutive
-//! packets of a flow into one segment before writing.
+//! A [`Tun`] interface carries IP packets, on Linux, Android, the Apple systems, FreeBSD, NetBSD
+//! and OpenBSD; a [`Tap`] interface carries Ethernet frames, on Linux, macOS and the BSDs.
+//! Building one gives a handle to configure the interface and its [`Queue`]s; each queue splits,
+//! once, into a [`Reader`] and a [`Writer`]. Frames are read and written a batch at a time or one
+//! packet at a time, asynchronously on Tokio or async-io, or blocking the thread. On Linux and
+//! OpenBSD, and for TAP interfaces on FreeBSD, the system hands over TCP segments of up to 64 KiB
+//! at once and takes them back the same way, and on Linux UDP segments too; [`Frame::segments`]
+//! cuts such a segment into ordinary packets inside the buffer it was read into, and the writer
+//! joins consecutive packets of a flow into one segment before writing.
 //!
 //! ```no_run
 //! # async fn example() -> std::io::Result<()> {
@@ -30,14 +31,28 @@ mod layer;
 mod stream;
 mod sys;
 
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
 pub use device::Tap;
 #[cfg(target_os = "linux")]
 pub use device::Uring;
 pub use device::{Builder, Device, Offload, Tun};
 pub use xtun_wire::{Checksum, Frame, Gso, GsoKind, Packet, Segments, checksum};
 pub use io::{Batch, Interrupt, Queue, Reader, ReaderStats, Writer, WriterStats};
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
 pub use layer::Ethernet;
 pub use layer::{Ip, Layer};
 #[cfg(feature = "futures")]

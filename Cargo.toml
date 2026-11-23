@@ -6,7 +6,7 @@ name = "xtun"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "TUN and TAP interfaces on Linux, Android and the Apple systems, with batched and offloaded packet I/O"
+description = "TUN and TAP interfaces on Linux, Android, the Apple systems, FreeBSD, NetBSD and OpenBSD, with batched and offloaded packet I/O"
 
 [features]
 default = ["tokio"]

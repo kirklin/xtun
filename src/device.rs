@@ -8,7 +8,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use ipnet::IpNet;
 
 use crate::io::Queue;
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
 use crate::layer::Ethernet;
 use crate::layer::{Ip, Layer};
 use crate::sys::{self, Tunnel};
@@ -29,7 +36,14 @@ pub struct Device<L: Layer = Ip> {
 pub type Tun = Device<Ip>;
 
 /// A TAP interface: Ethernet frames in and out. On macOS it is a pair of `feth` interfaces.
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
 pub type Tap = Device<Ethernet>;
 
 /// What a device does with segments larger than the MTU.
@@ -178,7 +192,8 @@ impl<L: Layer> fmt::Debug for Builder<L> {
 
 impl<L: Layer> Builder<L> {
     /// The interface name. Left out, the system picks one. On macOS a TUN interface must be
-    /// called `utun` and a number, and a TAP interface `feth` and a number.
+    /// called `utun` and a number, and a TAP interface `feth` and a number; on the BSDs `tun` or
+    /// `tap` and a number.
     pub fn name(mut self, name: impl Into<String>) -> Builder<L> {
         self.options.name = Some(name.into());
         self
@@ -202,9 +217,9 @@ impl<L: Layer> Builder<L> {
         self
     }
 
-    /// Whether the system hands over and takes TCP and UDP segments of up to 64 KiB, as Linux
-    /// does. On by default; other systems have no such offload, and packet information rules it
-    /// out.
+    /// Whether the system hands over and takes segments of up to 64 KiB: TCP and UDP on Linux,
+    /// TCP on OpenBSD and on FreeBSD's TAP interfaces. On by default; other systems have no such
+    /// offload, and packet information rules it out.
     pub fn offload(mut self, offload: bool) -> Builder<L> {
         self.options.offload = offload;
         self
@@ -309,7 +324,7 @@ impl<L: Layer> Builder<L> {
     }
 }
 
-#[cfg(target_vendor = "apple")]
+#[cfg(any(target_vendor = "apple", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
 impl Builder<Ip> {
     /// Whether packets carry the address family, four bytes, in front. Packets are then read
     /// and written as they are, without checksum work or segmentation.
@@ -319,7 +334,14 @@ impl Builder<Ip> {
     }
 }
 
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
 impl Builder<Ethernet> {
     /// The hardware address. Left out, the system makes one up.
     pub fn mac_address(mut self, mac: [u8; 6]) -> Builder<Ethernet> {
@@ -389,13 +411,15 @@ impl<L: Layer> Device<L> {
         self.tunnel.is_up()
     }
 
-    /// Brings the interface up or down.
+    /// Brings the interface up or down. NetBSD and OpenBSD check IPv6 addresses for duplicates on
+    /// the link again when the interface comes up: the call returns once they can be used, as
+    /// [`Device::add_address`] does.
     pub fn set_up(&self, up: bool) -> io::Result<()> {
         self.tunnel.set_up(up)
     }
 
     /// Whether the interface is up and its link is too: a TUN or TAP interface has a link while
-    /// a queue is open.
+    /// a queue is open; on FreeBSD a TUN interface needs an address as well.
     pub fn is_running(&self) -> io::Result<bool> {
         self.tunnel.is_running()
     }
@@ -405,7 +429,10 @@ impl<L: Layer> Device<L> {
         self.tunnel.interface().addresses()
     }
 
-    /// Adds an address; with prefix routes on, its subnet is reached through the interface.
+    /// Adds an address; with prefix routes on, its subnet is reached through the interface. The
+    /// address can be used once the call returns: NetBSD and OpenBSD check a new IPv6 address for
+    /// duplicates on the link first, which takes them about a second, and the call fails with
+    /// [`io::ErrorKind::AddrInUse`] when another host has it.
     pub fn add_address(&self, net: IpNet) -> io::Result<()> {
         self.insert(Address { net, peer: None })
     }
@@ -455,7 +482,7 @@ impl<L: Layer> Device<L> {
     }
 
     /// The broadcast address of the interface's first IPv4 address, if it has one. A
-    /// point-to-point interface of the Apple systems has none and fails with
+    /// point-to-point interface of the BSDs and the Apple systems has none and fails with
     /// [`io::ErrorKind::Unsupported`].
     pub fn broadcast(&self) -> io::Result<Option<Ipv4Addr>> {
         self.tunnel.interface().broadcast()
@@ -503,7 +530,14 @@ fn peer_address(net: IpNet, peer: IpAddr) -> io::Result<Address> {
     Ok(Address { net, peer: Some(peer) })
 }
 
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
 impl Device<Ethernet> {
     /// The hardware address.
     pub fn mac_address(&self) -> io::Result<[u8; 6]> {
@@ -524,8 +558,9 @@ where
     /// Wraps an interface that something else created, such as the descriptor Android's
     /// `VpnService` or iOS's packet tunnel hands to an application, and hands it over with its
     /// one queue. Fails for a descriptor of the other kind of interface. On Linux a descriptor
-    /// with `IFF_VNET_HDR` gets the offloads this library asks for. On the Apple systems packets
-    /// come without the address family in front.
+    /// with `IFF_VNET_HDR` gets the offloads this library asks for. On OpenBSD a descriptor with
+    /// `tun_hdr` keeps the offloads it has. On the BSDs and Apple systems packets come without
+    /// the address family in front.
     pub fn from_fd(fd: std::os::fd::OwnedFd) -> io::Result<(Device<L>, Queue<L>)> {
         let tunnel = Arc::new(<L::Tunnel as sys::Adopt>::adopt(fd, L::ETHERNET)?);
         let queue = Queue { tunnel: tunnel.clone(), index: 0 };
@@ -545,7 +580,8 @@ where
 
     /// The descriptor of a device with one queue, for something else to use, in exchange for
     /// the device and its queue. Fails, giving both back, while other handles of the device
-    /// exist.
+    /// exist. NetBSD keeps the interface after the descriptor is closed; a device that
+    /// [`Device::from_fd`] made of it removes it once told [`Device::set_persist`]`(false)`.
     pub fn into_fd(self, queue: Queue<L>) -> Result<std::os::fd::OwnedFd, (Device<L>, Queue<L>)> {
         let Device { tunnel, prefix_routes } = self;
         let Queue { tunnel: queued, index } = queue;
@@ -573,10 +609,11 @@ impl Device<Ip> {
     }
 }
 
-#[cfg(target_vendor = "apple")]
+#[cfg(any(target_vendor = "apple", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
 impl Device<Ip> {
     /// Changes whether packets carry the address family in front, from the next read and write
-    /// on. These systems always have it in the kernel, so only the framing changes.
+    /// on. These systems always have it in the kernel, so only the framing changes. On OpenBSD a
+    /// device with offloads takes none.
     pub fn set_packet_information(&self, on: bool) -> io::Result<()> {
         self.tunnel.set_packet_information(on)
     }
