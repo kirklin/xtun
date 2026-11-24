@@ -108,6 +108,10 @@ function test(filter: string): number {
   const machine = boot({ arch: "aarch64", disk, port, log });
   try {
     waitForSsh(port, 300, log);
+    // devd starts a DHCP client on every Ethernet interface that appears, the TAP interfaces of
+    // the tests among them: the client gives the interface an address of its own and empties
+    // the system's table of neighbors under the test.
+    sshMust(port, "service devd onestop");
     pushSource(port, source);
     const cargo = `cd ${source} && env CARGO_TARGET_DIR=${target} cargo test --release --offline`;
     sshShown(port, "uname -rm && rustc --version");
