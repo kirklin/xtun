@@ -17,6 +17,7 @@ mod common;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use common::{Build, Counters, Mode, Nat, reflect, stop, transfer};
@@ -34,8 +35,18 @@ fn ip(text: &str) -> IpAddr {
 
 /// Whether the system is Linux, which Android is too.
 const LINUX: bool = cfg!(any(target_os = "linux", target_os = "android"));
-/// Whether the library reads and writes through io_uring here: Android does not let it.
-const URING: bool = cfg!(target_os = "linux");
+/// The kernel release of a Linux system as major and minor number.
+fn linux_version() -> (u32, u32) {
+    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap();
+    let mut numbers = release.split(|c: char| !c.is_ascii_digit()).map(|part| part.parse::<u32>().unwrap());
+    (numbers.next().unwrap(), numbers.next().unwrap())
+}
+
+/// Whether the library reads and writes through io_uring here: 64-bit Linux from 6.4 on has it,
+/// and Android does not let applications use it.
+fn uring_here() -> bool {
+    cfg!(all(target_os = "linux", target_pointer_width = "64")) && linux_version() >= (6, 4)
+}
 
 /// A builder for a device named per test on Linux; macOS picks utun names itself.
 fn builder(name: &str) -> Builder {
@@ -156,20 +167,31 @@ async fn udp_round_trip_offload() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "creates interfaces: run as root with --ignored"]
 async fn udp_round_trip_uring() {
+    if !uring_here() {
+        let refused = uring(builder("xtuntest1"), true).build().unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::Unsupported, "a kernel without io_uring for TUN devices makes no device that needs it: {refused}");
+        return;
+    }
     udp_round_trip(true, true).await;
     udp_round_trip(false, true).await;
 }
 
+/// A subnet that no device of this run had before, as its number. Android closes the TCP
+/// connections of an address a moment after the address goes with its device, and those of the
+/// next device with it when that device has the same address.
+fn fresh_subnet() -> u8 {
+    static NEXT: AtomicU8 = AtomicU8::new(0);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 async fn through_reflector(offload: bool, mode: Mode, v6: bool, queues: usize, on: bool) {
-    let (local, peer, other, subnet) = if v6 {
-        ("fd73::1", "fd73::2", "fd73::3", "fd73::1/64")
-    } else {
-        ("10.73.0.1", "10.73.0.2", "10.73.0.3", "10.73.0.1/24")
-    };
-    let builder = with_queues(builder("xtuntest2").address(net(subnet)).offload(offload), queues);
+    let subnet = fresh_subnet();
+    let host = |number: u8| if v6 { format!("fd73:{subnet:x}::{number}") } else { format!("10.73.{subnet}.{number}") };
+    let address = format!("{}/{}", host(1), if v6 { 64 } else { 24 });
+    let builder = with_queues(builder("xtuntest2").address(net(&address)).offload(offload), queues);
     let (_device, handed) = uring(builder, on).build().unwrap();
     assert_eq!(handed.len(), queues);
-    let nat = Nat { local: ip(local), peer: ip(peer), other: ip(other), link: 0 };
+    let nat = Nat { local: ip(&host(1)), peer: ip(&host(2)), other: ip(&host(3)), link: 0 };
     let counters = Arc::new(Counters::default());
     let mut tasks = Vec::new();
     for queue in handed {
@@ -202,7 +224,7 @@ async fn tcp_one_packet_at_a_time() {
         if LINUX {
             through_reflector(true, Mode::Packets, v6, 1, false).await;
         }
-        if URING {
+        if uring_here() {
             through_reflector(true, Mode::Packets, v6, 1, true).await;
         }
     }
@@ -341,7 +363,7 @@ async fn tcp_through_the_device() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "creates interfaces: run as root with --ignored"]
 async fn tcp_through_the_device_with_offload() {
-    let rings: &[bool] = if URING { &[false, true] } else { &[false] };
+    let rings: &[bool] = if uring_here() { &[false, true] } else { &[false] };
     for &on in rings {
         for v6 in [false, true] {
             through_reflector(true, Mode::Pass, v6, 1, on).await;
@@ -355,7 +377,7 @@ async fn tcp_through_the_device_with_offload() {
 #[ignore = "creates interfaces: run as root with --ignored"]
 async fn tcp_through_four_queues() {
     through_reflector(true, Mode::Split, false, 4, false).await;
-    through_reflector(true, Mode::Pass, true, 4, URING).await;
+    through_reflector(true, Mode::Pass, true, 4, uring_here()).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -377,7 +399,7 @@ async fn a_device_hands_out_its_queues_once() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "creates interfaces: run as root with --ignored"]
 async fn a_deleted_interface_ends_the_reader() {
-    let rings: &[bool] = if URING { &[false, true] } else { &[false] };
+    let rings: &[bool] = if uring_here() { &[false, true] } else { &[false] };
     for &on in rings {
         let (_device, queues) = uring(builder("xtuntest4").address(net("10.75.0.1/24")), on).build().unwrap();
         let (mut reader, _writer) = ends(queues);
@@ -421,10 +443,12 @@ async fn large_packets_without_offload() {
 async fn adopts_a_descriptor() {
     use std::os::fd::{FromRawFd, OwnedFd};
     let flags = [(libc::IFF_TUN | libc::IFF_NO_PI, false), (libc::IFF_TUN | libc::IFF_NO_PI | libc::IFF_VNET_HDR, true)];
+    // The device that hands out interfaces, which Android keeps at a place of its own.
+    let clone_device = if cfg!(target_os = "android") { c"/dev/tun" } else { c"/dev/net/tun" };
     for (flags, offload) in flags {
         // SAFETY: plain open and ioctl on a request filled in here.
         let fd = unsafe {
-            let fd = libc::open(c"/dev/net/tun".as_ptr(), libc::O_RDWR | libc::O_CLOEXEC);
+            let fd = libc::open(clone_device.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC);
             assert!(fd >= 0);
             let mut request: libc::ifreq = std::mem::zeroed();
             for (slot, byte) in request.ifr_name.iter_mut().zip(b"xtuntest6") {
@@ -508,16 +532,13 @@ fn renames_and_brings_up_and_down() {
     device.set_up(true).unwrap();
     assert!(device.is_up().unwrap());
     assert!(eventually(|| device.is_running().unwrap()), "a TUN interface has a link while a queue is open");
-    let release = std::fs::read_to_string("/proc/sys/kernel/osrelease").unwrap();
-    let mut numbers = release.split(|c: char| !c.is_ascii_digit()).map(|part| part.parse::<u32>().unwrap());
-    let version = (numbers.next().unwrap(), numbers.next().unwrap());
     match device.set_name("xtuntest10") {
-        Ok(()) => {
-            assert!(version >= (6, 2), "Linux {release} renamed an interface that is up");
-            assert_eq!(device.name().unwrap(), "xtuntest10");
-        }
+        // Linux renames an interface that is up from 6.2 on, and so does an older kernel that a
+        // distribution has brought the change to.
+        Ok(()) => assert_eq!(device.name().unwrap(), "xtuntest10"),
         Err(error) => {
-            assert!(version < (6, 2), "Linux {release} renames interfaces that are up: {error}");
+            let version = linux_version();
+            assert!(version < (6, 2), "Linux {}.{} renames interfaces that are up: {error}", version.0, version.1);
             assert_eq!(error.raw_os_error(), Some(libc::EBUSY), "{error}");
         }
     }

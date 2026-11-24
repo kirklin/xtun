@@ -27,7 +27,7 @@ const arm = process.arch === "arm64";
 const abi = arm ? "arm64-v8a" : "x86_64";
 const target = arm ? "aarch64-linux-android" : "x86_64-linux-android";
 /// The oldest Android the programs run on.
-const api = 24;
+const api = 29;
 const device = "xtun_test";
 /// The emulator's console port, which names it to adb.
 const port = 5584;
