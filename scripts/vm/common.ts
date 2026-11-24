@@ -133,6 +133,24 @@ export interface Machine {
   extra?: string[];
 }
 
+/// A system that tests run on in a virtual machine, as the scripts of other repositories use it
+/// too: the machine that is made once, and how a run boots it.
+export interface System {
+  /// The directory of the system's files.
+  directory: string;
+  /// The port of this host that reaches the guest's SSH server.
+  port: number;
+  /// Makes the machine the runs start from, unless it is there, and returns its disk.
+  prepare(): Promise<string>;
+  /// A machine that boots from `disk`, with its serial console in `log`.
+  machine(disk: string, log: string): Machine;
+  /// How long the guest may take to open SSH.
+  bootSeconds: number;
+  /// What a command line in the guest starts with: the settings its shell needs that sshd
+  /// does not give.
+  shell: string;
+}
+
 /// QEMU's arguments for the serial console of a machine: its log, and its socket if it has one.
 function serial(machine: Machine): string[] {
   if (machine.console === undefined) {

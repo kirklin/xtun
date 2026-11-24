@@ -23,6 +23,7 @@ import {
   sshMust,
   sshShown,
   stop,
+  type System,
   waitForExit,
   waitForSsh,
 } from "./common.ts";
@@ -108,6 +109,20 @@ async function prepare(): Promise<void> {
   }
   renameSync(building, prepared);
 }
+
+export const system: System = {
+  directory,
+  port,
+  prepare: async () => {
+    if (!existsSync(prepared)) {
+      await prepare();
+    }
+    return prepared;
+  },
+  machine: (disk, log) => ({ ...machine(disk), log }),
+  bootSeconds: 300,
+  shell: `export ${path} && `,
+};
 
 /// Runs the tests in a machine that starts from the prepared image and is thrown away.
 function test(filter: string): number {

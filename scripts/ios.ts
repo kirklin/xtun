@@ -19,7 +19,7 @@ import { features } from "./linux.ts";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repo = resolve(here, "..");
-const target = process.arch === "arm64" ? "aarch64-apple-ios-sim" : "x86_64-apple-ios";
+export const target = process.arch === "arm64" ? "aarch64-apple-ios-sim" : "x86_64-apple-ios";
 
 interface Run {
   code: number;
@@ -78,7 +78,7 @@ function build(): { units: string[]; devices: string } {
   return { units: programs, devices };
 }
 
-interface Runtime {
+export interface Runtime {
   name: string;
   identifier: string;
   version: string;
@@ -89,7 +89,7 @@ interface Runtime {
 }
 
 /// The newest iOS runtime that is installed.
-function runtime(): Runtime {
+export function runtime(): Runtime {
   const all = JSON.parse(must("xcrun", ["simctl", "list", "runtimes", "-j"])).runtimes as Runtime[];
   const usable = all
     .filter((one) => one.platform === "iOS" && one.isAvailable)
@@ -102,7 +102,7 @@ function runtime(): Runtime {
 
 /// Runs the unit tests inside a simulated iPhone of the runtime, which is started for them
 /// unless it runs already. Returns whether all passed.
-function inSimulator(chosen: Runtime, programs: string[]): boolean {
+export function inSimulator(chosen: Runtime, programs: string[]): boolean {
   const devices = JSON.parse(must("xcrun", ["simctl", "list", "devices", "-j"])).devices[chosen.identifier] as {
     udid: string;
     name: string;
@@ -156,4 +156,6 @@ function main(): void {
   process.exit(result.status === 0 && unitsPassed ? 0 : 1);
 }
 
-main();
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main();
+}

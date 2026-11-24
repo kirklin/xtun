@@ -8,7 +8,7 @@
 import { existsSync, renameSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
 import process from "node:process";
-import { boot, download, drive, fatSeedDisk, guestProxy, home, key, must, overlay, pushSource, ssh, sshMust, sshShown, stop, waitForExit, waitForSsh } from "./common.ts";
+import { boot, download, drive, fatSeedDisk, guestProxy, home, key, type Machine, must, overlay, pushSource, ssh, sshMust, sshShown, stop, type System, waitForExit, waitForSsh } from "./common.ts";
 
 /// The stable release of OmniOS.
 const release = "r151060";
@@ -97,13 +97,29 @@ function prepare(): void {
   renameSync(disk, prepared);
 }
 
+function machine(disk: string, log: string): Machine {
+  return { arch: "x86_64", disk, port, log, memory: 8192 };
+}
+
+export const system: System = {
+  directory,
+  port,
+  prepare: async () => {
+    prepare();
+    return prepared;
+  },
+  machine,
+  bootSeconds,
+  shell: "",
+};
+
 /// Runs the tests in a machine that is thrown away afterwards. Returns their status. illumos has
 /// TUN interfaces only, so the device tests are all there is to run on interfaces.
 function test(filter: string): number {
   const disk = resolve(directory, "run.qcow2");
   overlay(prepared, disk);
   const log = resolve(directory, "run.log");
-  const machine = boot({ arch: "x86_64", disk, port, log, memory: 8192 });
+  const guest = boot(machine(disk, log));
   try {
     waitForSsh(port, bootSeconds, log);
     pushSource(port, source);
@@ -113,7 +129,7 @@ function test(filter: string): number {
     const device = sshShown(port, `${cargo} --no-fail-fast ${features} --test device -- --ignored --test-threads=1 --nocapture ${filter}`);
     return wire !== 0 ? wire : device;
   } finally {
-    stop(machine);
+    stop(guest);
     rmSync(disk, { force: true });
   }
 }

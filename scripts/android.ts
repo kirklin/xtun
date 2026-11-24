@@ -22,16 +22,16 @@ import { features } from "./linux.ts";
 const here = dirname(fileURLToPath(import.meta.url));
 const repo = resolve(here, "..");
 const sdk = process.env.ANDROID_HOME ?? `${process.env.HOME}/Library/Android/sdk`;
-const adb = resolve(sdk, "platform-tools/adb");
+export const adb = resolve(sdk, "platform-tools/adb");
 const arm = process.arch === "arm64";
 const abi = arm ? "arm64-v8a" : "x86_64";
-const target = arm ? "aarch64-linux-android" : "x86_64-linux-android";
+export const target = arm ? "aarch64-linux-android" : "x86_64-linux-android";
 /// The oldest Android the programs run on.
 const api = 29;
 const device = "xtun_test";
 /// The emulator's console port, which names it to adb.
 const port = 5584;
-const serial = `emulator-${port}`;
+export const serial = `emulator-${port}`;
 const guest = "/data/local/tmp/xtun";
 /// The test programs that run on real interfaces.
 const suites = ["device", "tap"];
@@ -72,7 +72,7 @@ function newest(parent: string): string {
 }
 
 /// The C compiler of the NDK that links programs for the target.
-function linker(): string {
+export function linker(): string {
   const prebuilt = resolve(newest(resolve(sdk, "ndk")), "toolchains/llvm/prebuilt");
   const tools = resolve(prebuilt, readdirSync(prebuilt)[0], "bin");
   const found = resolve(tools, `${target}${api}-clang`);
@@ -123,12 +123,12 @@ function build(): string[] {
   return programs;
 }
 
-function shell(command: string): Run {
+export function shell(command: string): Run {
   return run(adb, ["-s", serial, "shell", command]);
 }
 
 /// Waits until no emulator runs the virtual device: one that is shutting down still holds it.
-function waitUntilGone(): void {
+export function waitUntilGone(): void {
   // The bracket keeps the pattern from matching pgrep itself.
   const alive = () => run("pgrep", ["-f", `[-]avd ${device}`]).code === 0;
   for (let i = 0; i < 120 && alive(); i += 1) {
@@ -141,7 +141,7 @@ function waitUntilGone(): void {
 
 /// Starts the emulator unless it runs already, and waits until the system is up with a root
 /// shell. Returns whether it was started here.
-function boot(): boolean {
+export function boot(): boolean {
   const running = must(adb, ["devices"]).includes(serial);
   if (!running) {
     // A run that just stopped the emulator may not have let go of the virtual device yet.
@@ -223,4 +223,6 @@ function main(): void {
   process.exit(status);
 }
 
-main();
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main();
+}

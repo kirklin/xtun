@@ -6,7 +6,7 @@
 import { existsSync, renameSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
 import process from "node:process";
-import { boot, download, drive, guestProxy, home, key, must, overlay, pushSource, seedDisk, ssh, sshMust, sshShown, stop, waitForExit, waitForSsh } from "./common.ts";
+import { boot, download, drive, guestProxy, home, key, type Machine, must, overlay, pushSource, seedDisk, ssh, sshMust, sshShown, stop, type System, waitForExit, waitForSsh } from "./common.ts";
 
 const release = "15.1-RELEASE";
 /// The official image that takes its first settings from a seed disk.
@@ -100,14 +100,30 @@ function prepare(): void {
   renameSync(disk, prepared);
 }
 
+function machine(disk: string, log: string): Machine {
+  return { arch: "aarch64", disk, port, log };
+}
+
+export const system: System = {
+  directory,
+  port,
+  prepare: async () => {
+    prepare();
+    return prepared;
+  },
+  machine,
+  bootSeconds: 300,
+  shell: "",
+};
+
 /// Runs the tests in a machine that is thrown away afterwards. Returns their status.
 function test(filter: string): number {
   const disk = resolve(directory, "run.qcow2");
   overlay(prepared, disk);
   const log = resolve(directory, "run.log");
-  const machine = boot({ arch: "aarch64", disk, port, log });
+  const guest = boot(machine(disk, log));
   try {
-    waitForSsh(port, 300, log);
+    waitForSsh(port, system.bootSeconds, log);
     // devd starts a DHCP client on every Ethernet interface that appears, the TAP interfaces of
     // the tests among them: the client gives the interface an address of its own and empties
     // the system's table of neighbors under the test.
@@ -119,7 +135,7 @@ function test(filter: string): number {
     const device = sshShown(port, `${cargo} --no-fail-fast ${features} --test device --test tap -- --ignored --test-threads=1 --nocapture ${filter}`);
     return wire !== 0 ? wire : device;
   } finally {
-    stop(machine);
+    stop(guest);
     rmSync(disk, { force: true });
   }
 }

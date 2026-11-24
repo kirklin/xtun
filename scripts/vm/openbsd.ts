@@ -14,6 +14,7 @@ import {
   guestProxy,
   home,
   key,
+  type Machine,
   must,
   openConsole,
   overlay,
@@ -23,6 +24,7 @@ import {
   sshMust,
   sshShown,
   stop,
+  type System,
   waitForExit,
   waitForSsh,
 } from "./common.ts";
@@ -144,15 +146,21 @@ async function prepared(): Promise<string> {
   return image;
 }
 
+function machine(disk: string, log: string): Machine {
+  return { arch: "aarch64", disk, port, log };
+}
+
+export const system: System = { directory, port, prepare: prepared, machine, bootSeconds: 300, shell: "" };
+
 async function main(): Promise<void> {
   const filter = process.argv[2] ?? "";
   const disk = resolve(directory, "run.qcow2");
   overlay(await prepared(), disk);
   const log = resolve(directory, "run.log");
-  const machine = boot({ arch: "aarch64", disk, port, log });
+  const guest = boot(machine(disk, log));
   let status = 1;
   try {
-    waitForSsh(port, 300, log);
+    waitForSsh(port, system.bootSeconds, log);
     pushSource(port, source);
     const script = [
       "set -e",
@@ -163,7 +171,7 @@ async function main(): Promise<void> {
     ].join("\n");
     status = sshShown(port, script);
   } finally {
-    stop(machine);
+    stop(guest);
     rmSync(disk, { force: true });
   }
   process.exit(status);
