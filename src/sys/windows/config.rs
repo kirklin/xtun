@@ -8,6 +8,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use ipnet::IpNet;
+use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{CM_LOCATE_DEVNODE_NORMAL, CM_Locate_DevNodeW, CR_NO_SUCH_DEVNODE};
 use windows_sys::Win32::Foundation::{ERROR_NOT_FOUND, WIN32_ERROR};
 use windows_sys::Win32::NetworkManagement::IpHelper::{
     ConvertInterfaceLuidToAlias, ConvertInterfaceLuidToGuid, CreateIpForwardEntry2, CreateUnicastIpAddressEntry,
@@ -22,6 +23,7 @@ use windows_sys::Win32::Networking::WinSock::{
     ADDRESS_FAMILY, AF_INET, AF_INET6, AF_UNSPEC, IpDadStatePreferred, MIB_IPPROTO_NETMGMT, SOCKADDR_INET,
 };
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW};
+use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
 use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows_sys::core::GUID;
 
@@ -40,7 +42,7 @@ pub(super) fn alias(luid: &NET_LUID_LH) -> Result<String> {
     Ok(String::from_utf16_lossy(&name[..length]))
 }
 
-/// The name and the LUID of every interface.
+/// The name and the LUID of every interface, without what is left of adapters that are gone.
 fn interfaces() -> Result<Vec<(String, NET_LUID_LH)>> {
     let mut table: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
     // SAFETY: the table is allocated by the call and freed below.
@@ -49,6 +51,7 @@ fn interfaces() -> Result<Vec<(String, NET_LUID_LH)>> {
     let rows = unsafe { std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize) };
     let found = rows
         .iter()
+        .filter(|row| !leftover(&row.InterfaceGuid))
         .map(|row| {
             let length = row.Alias.iter().position(|unit| *unit == 0).unwrap_or(row.Alias.len());
             (String::from_utf16_lossy(&row.Alias[..length]), row.InterfaceLuid)
@@ -57,6 +60,48 @@ fn interfaces() -> Result<Vec<(String, NET_LUID_LH)>> {
     // SAFETY: the table came from GetIfTable2.
     unsafe { FreeMibTable(table.cast()) };
     Ok(found)
+}
+
+/// Where Windows lists the network connections, by the GUID of their interface.
+pub(super) const CONNECTIONS: &str = r"SYSTEM\CurrentControlSet\Control\Network\{4D36E972-E325-11CE-BFC1-08002BE10318}";
+
+/// The GUID as Windows writes it in the registry and in device paths.
+pub(super) fn guid_text(guid: &GUID) -> String {
+    let d4 = guid.data4;
+    format!(
+        "{{{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
+        guid.data1, guid.data2, guid.data3, d4[0], d4[1], d4[2], d4[3], d4[4], d4[5], d4[6], d4[7]
+    )
+}
+
+/// Whether the interface with `guid` is what is left of an adapter that is gone. Windows 11
+/// keeps the interface of an adapter that ran for more than a minute after it removed the
+/// adapter: down, without addresses, and under the adapter's name, until another adapter takes
+/// its place. Its network connection still names the adapter's device, which is no more.
+fn leftover(guid: &GUID) -> bool {
+    let path = wide(format!(r"{CONNECTIONS}\{}\Connection", guid_text(guid)).as_ref());
+    let mut device = [0u16; 512];
+    let mut size = size_of_val(&device) as u32;
+    // SAFETY: both strings are NUL-terminated and `device` is writable for `size` bytes; a string
+    // read this way ends with a NUL.
+    let read = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            path.as_ptr(),
+            wide("PnPInstanceId".as_ref()).as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            device.as_mut_ptr().cast(),
+            &mut size,
+        )
+    };
+    // An interface without an adapter of its own, as the loopback interface, has no device.
+    if read != 0 {
+        return false;
+    }
+    let mut node = 0u32;
+    // SAFETY: `device` is NUL-terminated and `node` is writable.
+    unsafe { CM_Locate_DevNodeW(&mut node, device.as_ptr(), CM_LOCATE_DEVNODE_NORMAL) == CR_NO_SUCH_DEVNODE }
 }
 
 /// Whether Windows takes two interface names for the same: it disregards case.
@@ -146,11 +191,11 @@ pub(super) fn await_link(luid: &NET_LUID_LH, timeout: Duration) -> Result<()> {
 const REMOVAL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Waits for the interface of an adapter that was removed to be gone: Windows takes it away a
-/// moment after the adapter. Once it is gone, its name is free for the next adapter. Returns
-/// whether it is gone.
+/// moment after the adapter, or keeps no more of it than its place in the list of interfaces.
+/// Once it is gone, its name is free for the next adapter. Returns whether it is gone.
 pub(super) fn await_gone(luid: &NET_LUID_LH) -> bool {
     let start = Instant::now();
-    while link(luid).is_ok() {
+    while link(luid).is_ok_and(|row| !leftover(&row.InterfaceGuid)) {
         if start.elapsed() >= REMOVAL_TIMEOUT {
             return false;
         }

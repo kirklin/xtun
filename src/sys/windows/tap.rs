@@ -34,6 +34,7 @@ use windows_sys::Win32::System::Registry::{
 use super::tap_io::{Sink, Source};
 use super::wait::{Event, wait};
 use super::wintun::wide;
+use super::config::{CONNECTIONS, guid_text};
 use super::{Interface, check_options, check_queue, config};
 use crate::device::{Offload, Options};
 
@@ -265,15 +266,6 @@ fn name_new(luid: &NET_LUID_LH, name: &str) -> Result<()> {
             result => return result,
         }
     }
-}
-
-/// The GUID as Windows writes it in the registry and in device paths.
-fn guid_text(guid: &windows_sys::core::GUID) -> String {
-    let d4 = guid.data4;
-    format!(
-        "{{{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
-        guid.data1, guid.data2, guid.data3, d4[0], d4[1], d4[2], d4[3], d4[4], d4[5], d4[6], d4[7]
-    )
 }
 
 /// Opens the adapter's file for overlapped reads and writes, waiting for a new adapter to start.
@@ -540,9 +532,6 @@ fn driver_is_tap(set: &DeviceSet, device: &SP_DEVINFO_DATA, driver: &SP_DRVINFO_
     };
     Ok(HARDWARE_IDS.iter().any(|ours| id.eq_ignore_ascii_case(ours)))
 }
-
-/// Where Windows lists the network connections, by the GUID of their interface.
-const CONNECTIONS: &str = r"SYSTEM\CurrentControlSet\Control\Network\{4D36E972-E325-11CE-BFC1-08002BE10318}";
 
 /// Waits until Windows lists a new adapter as a network connection, under a name of its own
 /// choice, which it does a moment after it installed the adapter. Only a listed connection

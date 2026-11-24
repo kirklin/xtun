@@ -46,19 +46,30 @@ fn ends<L: xtun::Layer>(mut queues: Vec<Queue<L>>) -> (Reader<L>, Writer<L>) {
     queues.remove(0).split().unwrap()
 }
 
-/// Whether Windows has an interface whose alias is `name`.
+/// Whether Windows has an adapter whose interface is called `name`.
 fn exists(name: &str) -> bool {
-    use windows_sys::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetIfTable2, MIB_IF_TABLE2};
-    let wide: Vec<u16> = name.encode_utf16().collect();
-    let mut table: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
-    // SAFETY: the table is allocated by the call and freed below.
-    assert_eq!(unsafe { GetIfTable2(&mut table) }, 0);
-    // SAFETY: the table holds `NumEntries` rows.
-    let rows = unsafe { std::slice::from_raw_parts((*table).Table.as_ptr(), (*table).NumEntries as usize) };
-    let found = rows.iter().any(|row| row.Alias[..wide.len()] == wide[..] && row.Alias[wide.len()] == 0);
-    // SAFETY: the table came from GetIfTable2.
-    unsafe { FreeMibTable(table.cast()) };
-    found
+    use windows_sys::Win32::NetworkManagement::IpHelper::{GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH};
+    let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
+    let mut size = 0u32;
+    // SAFETY: without a buffer the call only reports the size it needs.
+    unsafe { GetAdaptersAddresses(0, 0, std::ptr::null(), std::ptr::null_mut(), &mut size) };
+    // Room for adapters that come meanwhile, in units that align the list.
+    size = (size + 64 * 1024).next_multiple_of(8);
+    let mut buffer = vec![0u64; size as usize / 8];
+    let list = buffer.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
+    // SAFETY: the buffer is writable for `size` bytes.
+    assert_eq!(unsafe { GetAdaptersAddresses(0, 0, std::ptr::null(), list, &mut size) }, 0);
+    let mut adapter = list.cast_const();
+    while !adapter.is_null() {
+        // SAFETY: the list ends with a null pointer, and every name with a NUL.
+        let found = unsafe { std::slice::from_raw_parts((*adapter).FriendlyName, wide.len()) == &wide[..] };
+        if found {
+            return true;
+        }
+        // SAFETY: as above.
+        adapter = unsafe { (*adapter).Next };
+    }
+    false
 }
 
 /// Runs a system tool and returns what it printed; it has to succeed.
@@ -522,4 +533,19 @@ fn tap_a_persistent_device_stays_and_is_taken_over() {
     device.set_persist(false).unwrap();
     drop((device, queues));
     assert!(!exists("xtuntap3"), "told it may go, the adapter goes with the device");
+}
+
+#[test]
+#[ignore = "creates adapters: run with scripts/vm/windows.ts"]
+fn wintun_a_name_is_free_once_its_adapter_is_gone() {
+    let (device, queues) = tun("xtuntest10").address(net("10.189.0.1/24")).build().unwrap();
+    // Windows 11 keeps the interface of an adapter that ran for more than a minute in its list
+    // of interfaces when the adapter is gone.
+    std::thread::sleep(Duration::from_secs(90));
+    let closing = Instant::now();
+    drop((device, queues));
+    assert!(closing.elapsed() < Duration::from_secs(3), "closing waits for the adapter, which goes at once");
+    assert!(!exists("xtuntest10"));
+    let (device, _queues) = tun("xtuntest10").reuse(false).build().unwrap();
+    assert_eq!(device.name().unwrap(), "xtuntest10", "the next adapter takes the name");
 }
