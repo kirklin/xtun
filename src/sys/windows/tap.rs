@@ -20,8 +20,8 @@ use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiOpenDevRegKey, SetupDiSetClassInstallParamsW, SetupDiSetDeviceRegistryPropertyW, SetupDiSetSelectedDriverW,
 };
 use windows_sys::Win32::Foundation::{
-    ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_IO_PENDING, ERROR_NO_MORE_ITEMS, GENERIC_READ, GENERIC_WRITE, GetLastError,
-    HANDLE, INVALID_HANDLE_VALUE, WIN32_ERROR,
+    ERROR_FILE_NOT_FOUND, ERROR_INSUFFICIENT_BUFFER, ERROR_IO_PENDING, ERROR_NO_MORE_ITEMS, ERROR_TRANSACTION_NOT_ACTIVE, GENERIC_READ,
+    GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WIN32_ERROR,
 };
 use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
 use windows_sys::Win32::Storage::FileSystem::{CreateFileW, FILE_ATTRIBUTE_SYSTEM, FILE_FLAG_OVERLAPPED, OPEN_EXISTING};
@@ -109,7 +109,7 @@ impl crate::sys::Tunnel for Tap {
             let (adapter, luid) = step("installing a TAP adapter", install())?;
             step("waiting for the TAP adapter's interface", config::await_link(&luid, START_TIMEOUT))?;
             step("waiting for Windows to list the TAP adapter", connection_listed(&adapter.guid))?;
-            step("naming the TAP adapter", config::rename(&luid, &name))?;
+            step("naming the TAP adapter", name_new(&luid, &name))?;
             (adapter, luid)
         };
         if let Some(mac) = options.mac_address {
@@ -249,6 +249,22 @@ impl Tap {
 /// `result`, with an error that says which step of making the adapter failed.
 fn step<T>(what: &str, result: Result<T>) -> Result<T> {
     result.map_err(|error| Error::new(error.kind(), format!("{what}: {error}")))
+}
+
+/// Names an adapter that was just installed. Windows may still be writing the adapter's keys in
+/// the registry, in a transaction that the name becomes part of: when that transaction ends
+/// under it, the name is refused as part of a transaction that is no longer active, and is set
+/// again.
+fn name_new(luid: &NET_LUID_LH, name: &str) -> Result<()> {
+    let deadline = Instant::now() + START_TIMEOUT;
+    loop {
+        match config::rename(luid, name) {
+            Err(error) if error.raw_os_error() == Some(ERROR_TRANSACTION_NOT_ACTIVE as i32) && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            result => return result,
+        }
+    }
 }
 
 /// The GUID as Windows writes it in the registry and in device paths.
