@@ -206,7 +206,7 @@ async fn through_reflector(offload: bool, mode: Mode, v6: bool, queues: usize, o
         if mode != Mode::Packets {
             assert!(segments > 0, "the kernel hands over segments");
         }
-        if mode != Mode::Pass {
+        if matches!(mode, Mode::Split | Mode::Packets | Mode::Pieces) {
             // Without joining every packet is a write of its own. How many packets go into a
             // write depends on how many of them are bare acknowledgements, which nothing joins.
             assert!(packets > writes * 2, "cut packets are joined again: {packets} packets in {writes} writes");
@@ -354,8 +354,9 @@ async fn streams_and_sinks() {
 #[ignore = "creates interfaces: run as root with --ignored"]
 async fn tcp_through_the_device() {
     for v6 in [false, true] {
-        through_reflector(false, Mode::Pass, v6, 1, false).await;
-        through_reflector(false, Mode::Split, v6, 1, false).await;
+        for mode in [Mode::Pass, Mode::Split, Mode::Pieces, Mode::Kept] {
+            through_reflector(false, mode, v6, 1, false).await;
+        }
     }
 }
 
@@ -366,8 +367,9 @@ async fn tcp_through_the_device_with_offload() {
     let rings: &[bool] = if uring_here() { &[false, true] } else { &[false] };
     for &on in rings {
         for v6 in [false, true] {
-            through_reflector(true, Mode::Pass, v6, 1, on).await;
-            through_reflector(true, Mode::Split, v6, 1, on).await;
+            for mode in [Mode::Pass, Mode::Split, Mode::Pieces, Mode::Kept] {
+                through_reflector(true, mode, v6, 1, on).await;
+            }
         }
     }
 }
@@ -378,6 +380,8 @@ async fn tcp_through_the_device_with_offload() {
 async fn tcp_through_four_queues() {
     through_reflector(true, Mode::Split, false, 4, false).await;
     through_reflector(true, Mode::Pass, true, 4, uring_here()).await;
+    through_reflector(true, Mode::Kept, false, 4, uring_here()).await;
+    through_reflector(true, Mode::Pieces, true, 4, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]

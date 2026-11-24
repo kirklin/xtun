@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use xtun::checksum::{Sum, pseudo_v4, pseudo_v6};
-use xtun::{Checksum, Layer, Packet, Reader, Writer};
+use xtun::{Checksum, Layer, OwnedFrame, Packet, Pieces, Reader, Writer};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -158,6 +158,12 @@ pub enum Mode {
     /// Packets are read one at a time, whole and with complete checksums, and the packets that
     /// are ready together are written as a batch.
     Packets,
+    /// Frames are cut into packets as for [`Mode::Split`], and each packet is written in
+    /// pieces: its headers, and its payload behind them in two stretches.
+    Pieces,
+    /// Frames are taken out of their batches and queued, segments whole, the way a stack keeps
+    /// what it received; what takes them from the queue writes each in pieces.
+    Kept,
 }
 
 fn octets(ip: IpAddr) -> Vec<u8> {
@@ -251,10 +257,109 @@ async fn reflect_packets<L: Layer>(mut reader: Reader<L>, mut writer: Writer<L>,
     }
 }
 
+/// Where the headers of a frame end: behind the link layer, IP and TCP or UDP headers, or
+/// behind the IP header for any other protocol.
+fn headers(frame: &[u8], link: usize) -> usize {
+    let packet = &frame[link..];
+    let (ip_len, protocol) = if packet[0] >> 4 == 6 { (40, packet[6]) } else { (usize::from(packet[0] & 0x0f) * 4, packet[9]) };
+    let transport = match protocol {
+        6 => packet.get(ip_len + 12).map_or(0, |byte| usize::from(byte >> 4) * 4),
+        17 => 8,
+        _ => 0,
+    };
+    (link + ip_len + transport).min(frame.len())
+}
+
+/// A packet as its headers and its payload in two stretches.
+fn in_pieces(packet: &[u8], link: usize) -> (&[u8], [&[u8]; 2]) {
+    let (head, payload) = packet.split_at(headers(packet, link));
+    let (first, second) = payload.split_at(payload.len() / 2);
+    (head, [first, second])
+}
+
+/// Reflects frames that are taken out of their batches until reading or writing fails.
+async fn reflect_kept<L: Layer>(mut reader: Reader<L>, mut writer: Writer<L>, nat: Nat, counters: Arc<Counters>) -> io::Result<()> {
+    let (queue, mut queued) = tokio::sync::mpsc::channel::<Vec<OwnedFrame>>(4);
+    let segments = &counters.segments;
+    let reading = async move {
+        loop {
+            let mut batch = reader.recv().await?;
+            let mut kept = Vec::with_capacity(batch.len());
+            for frame in batch.frames() {
+                if frame.gso().is_some() {
+                    segments.fetch_add(1, Ordering::Relaxed);
+                }
+                // Windows adapters and the BPF device of a layer 2 interface on macOS hand over
+                // frames that are copied when they are taken; everywhere else a frame has a
+                // block to itself.
+                let copied = cfg!(windows) || (cfg!(target_os = "macos") && nat.link > 0);
+                match frame.block_len() {
+                    Some(block) => assert!(!copied && block >= frame.data().len(), "a frame of {} bytes in a block of {block}", frame.data().len()),
+                    None => assert!(copied, "a frame without a block of its own"),
+                }
+                kept.push(frame.into_owned());
+            }
+            assert!(batch.is_empty(), "every frame was taken out");
+            drop(batch);
+            if queue.send(kept).await.is_err() {
+                return Ok::<(), io::Error>(());
+            }
+        }
+    };
+    let writing = async {
+        while let Some(mut frames) = queued.recv().await {
+            frames.retain_mut(|frame| {
+                let checksum = frame.checksum();
+                rewrite(frame.data_mut(), checksum, &nat)
+            });
+            let before = writer.stats();
+            write_kept(&mut writer, frames, nat.link).await?;
+            let after = writer.stats();
+            counters.packets.fetch_add(after.packets - before.packets, Ordering::Relaxed);
+            counters.writes.fetch_add(after.writes - before.writes, Ordering::Relaxed);
+        }
+        Ok::<(), io::Error>(())
+    };
+    tokio::try_join!(reading, writing).map(|_| ())
+}
+
+/// Writes frames that were kept, each in pieces that are `Bytes` of the frame.
+#[cfg(feature = "bytes")]
+async fn write_kept<L: Layer>(writer: &mut Writer<L>, frames: Vec<OwnedFrame>, link: usize) -> io::Result<()> {
+    use bytes::Bytes;
+    let kept: Vec<(Bytes, [Bytes; 2], Checksum, Option<xtun::Gso>)> = frames
+        .into_iter()
+        .map(|frame| {
+            let (checksum, gso) = (frame.checksum(), frame.gso());
+            let bytes = Bytes::from(frame);
+            let (head, body) = in_pieces(&bytes, link);
+            (bytes.slice_ref(head), body.map(|piece| bytes.slice_ref(piece)), checksum, gso)
+        })
+        .collect();
+    let packets: Vec<Pieces<'_, Bytes>> =
+        kept.iter().map(|(head, body, checksum, gso)| Pieces { head: &head[..], body: &body[..], checksum: *checksum, gso: *gso }).collect();
+    writer.send_pieces(&packets).await
+}
+
+/// Writes frames that were kept, each in pieces of its bytes.
+#[cfg(not(feature = "bytes"))]
+async fn write_kept<L: Layer>(writer: &mut Writer<L>, frames: Vec<OwnedFrame>, link: usize) -> io::Result<()> {
+    let pieces: Vec<(&[u8], [&[u8]; 2])> = frames.iter().map(|frame| in_pieces(frame.data(), link)).collect();
+    let packets: Vec<Pieces<'_>> = frames
+        .iter()
+        .zip(&pieces)
+        .map(|(frame, (head, body))| Pieces { head, body: &body[..], checksum: frame.checksum(), gso: frame.gso() })
+        .collect();
+    writer.send_pieces(&packets).await
+}
+
 /// Reflects until reading or writing fails.
 pub async fn reflect<L: Layer>(mut reader: Reader<L>, mut writer: Writer<L>, nat: Nat, mode: Mode, counters: Arc<Counters>) -> io::Result<()> {
     if mode == Mode::Packets {
         return reflect_packets(reader, writer, nat, counters).await;
+    }
+    if mode == Mode::Kept {
+        return reflect_kept(reader, writer, nat, counters).await;
     }
     let mut pool: Vec<(Vec<u8>, Checksum)> = Vec::new();
     loop {
@@ -272,7 +377,7 @@ pub async fn reflect<L: Layer>(mut reader: Reader<L>, mut writer: Writer<L>, nat
                 let packets: Vec<Packet<'_>> = frames.iter().map(|frame| frame.packet()).collect();
                 writer.send(&packets).await?;
             }
-            Mode::Split => {
+            Mode::Split | Mode::Pieces => {
                 let mut used = 0;
                 for mut frame in batch.frames() {
                     if frame.gso().is_some() {
@@ -294,11 +399,21 @@ pub async fn reflect<L: Layer>(mut reader: Reader<L>, mut writer: Writer<L>, nat
                         used += 1;
                     }
                 }
-                let packets: Vec<Packet<'_>> =
-                    pool[..used].iter().map(|(buffer, checksum)| Packet::new(buffer).with_checksum(*checksum)).collect();
-                writer.send(&packets).await?;
+                if mode == Mode::Pieces {
+                    let pieces: Vec<(&[u8], [&[u8]; 2])> = pool[..used].iter().map(|(buffer, _)| in_pieces(buffer, nat.link)).collect();
+                    let packets: Vec<Pieces<'_>> = pool[..used]
+                        .iter()
+                        .zip(&pieces)
+                        .map(|((_, checksum), (head, body))| Pieces::new(head, &body[..]).with_checksum(*checksum))
+                        .collect();
+                    writer.send_pieces(&packets).await?;
+                } else {
+                    let packets: Vec<Packet<'_>> =
+                        pool[..used].iter().map(|(buffer, checksum)| Packet::new(buffer).with_checksum(*checksum)).collect();
+                    writer.send(&packets).await?;
+                }
             }
-            Mode::Packets => unreachable!("reflected packet by packet"),
+            Mode::Packets | Mode::Kept => unreachable!("reflected by a function of its own"),
         }
         let after = writer.stats();
         counters.packets.fetch_add(after.packets - before.packets, Ordering::Relaxed);

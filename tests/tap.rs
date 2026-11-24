@@ -232,7 +232,7 @@ async fn through_reflector(offload: bool, mode: Mode, v6: bool) {
         if mode != Mode::Packets {
             assert!(segments > 0, "the kernel hands over segments of Ethernet frames");
         }
-        if mode != Mode::Pass {
+        if matches!(mode, Mode::Split | Mode::Packets | Mode::Pieces) {
             // Without joining every packet is a write of its own. How many packets go into a
             // write depends on how many of them are bare acknowledgements, which nothing joins.
             assert!(packets > writes * 2, "cut frames are joined again: {packets} packets in {writes} writes");
@@ -246,7 +246,7 @@ async fn through_reflector(offload: bool, mode: Mode, v6: bool) {
 #[ignore = "creates interfaces: run as root with --ignored"]
 async fn tcp_through_frames() {
     for v6 in [false, true] {
-        for mode in [Mode::Pass, Mode::Split, Mode::Packets] {
+        for mode in [Mode::Pass, Mode::Split, Mode::Packets, Mode::Pieces, Mode::Kept] {
             through_reflector(false, mode, v6).await;
         }
     }
@@ -257,7 +257,7 @@ async fn tcp_through_frames() {
 #[ignore = "creates interfaces: run as root with --ignored"]
 async fn tcp_through_frames_with_offload() {
     for v6 in [false, true] {
-        for mode in [Mode::Pass, Mode::Split, Mode::Packets] {
+        for mode in [Mode::Pass, Mode::Split, Mode::Packets, Mode::Pieces, Mode::Kept] {
             through_reflector(true, mode, v6).await;
         }
     }
