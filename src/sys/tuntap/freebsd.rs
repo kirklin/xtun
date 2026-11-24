@@ -132,13 +132,17 @@ pub const IFCAP_RXCSUM: c_int = 1 << 0;
 pub const IFCAP_TXCSUM: c_int = 1 << 1;
 pub const IFCAP_TSO4: c_int = 1 << 8;
 pub const IFCAP_TSO6: c_int = 1 << 9;
-pub const IFCAP_LRO: c_int = 1 << 10;
 pub const IFCAP_RXCSUM_IPV6: c_int = 1 << 21;
 pub const IFCAP_TXCSUM_IPV6: c_int = 1 << 22;
 
-/// What a tap device with a virtio header offers, all turned on.
-pub const OFFLOAD_CAPABILITIES: c_int =
-    IFCAP_RXCSUM | IFCAP_TXCSUM | IFCAP_RXCSUM_IPV6 | IFCAP_TXCSUM_IPV6 | IFCAP_TSO4 | IFCAP_TSO6 | IFCAP_LRO;
+/// What is turned on of what a tap device with a virtio header offers: checksums left to
+/// either side and TCP segments in both directions. The system's own joining of the frames it
+/// is written, `IFCAP_LRO`, stays off. The driver sets the state of that joining up anew
+/// whenever the interface is initialised, as it is when an address is added, and takes no
+/// account of a write that is under way: the write then reads the half made state and the
+/// kernel faults. The writer joins packets itself, and the system takes the segments as they
+/// are.
+pub const OFFLOAD_CAPABILITIES: c_int = IFCAP_RXCSUM | IFCAP_TXCSUM | IFCAP_RXCSUM_IPV6 | IFCAP_TXCSUM_IPV6 | IFCAP_TSO4 | IFCAP_TSO6;
 
 /// The virtio header that FreeBSD takes: without the count of merged buffers.
 pub const VNET_LEN: c_int = 10;
