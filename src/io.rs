@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 use std::time::{Duration, Instant};
 
-use xtun_wire::{Checksum, Decoded, Frame, Gso, Packet, Plan, Takes, Writes, take_first};
+use xtun_wire::{Checksum, Decoded, Frame, Gso, Packet, Parts, Pieces, Plan, Takes, Writes, take_first};
 
 use crate::layer::{Ip, Layer};
 use crate::sys::{self, Tunnel};
@@ -353,7 +353,8 @@ pub struct Reader<L: Layer = Ip> {
     stats: ReaderStats,
 }
 
-/// Writes to one queue of a device: a batch of packets at a time, or one packet in pieces.
+/// Writes to one queue of a device: a batch of packets at a time, each in one stretch or in
+/// pieces.
 ///
 /// Every way of writing comes in the same four forms as reading. The writer hands the packets
 /// it is given to the device; what the device cannot take yet is copied and written before
@@ -645,6 +646,38 @@ impl<L: Layer> Writer<L> {
         self.blocking_flush()
     }
 
+    /// [`Writer::send`] for packets whose bytes come in pieces: each has its headers in its
+    /// head and its payload in the pieces behind it, which may be of any type that holds bytes,
+    /// such as `&[u8]`, `Vec<u8>` or `Bytes`. The pieces go to the device as they lie; what
+    /// [`Writer::send`] does with packets, joining runs of a flow, cutting segments and
+    /// completing checksums, is done with these without putting their bytes together. A packet
+    /// may come in up to 1023 pieces, its head counted.
+    pub async fn send_pieces<B: AsRef<[u8]>>(&mut self, packets: &[Pieces<'_, B>]) -> io::Result<()> {
+        poll_fn(|cx| self.poll_flush(cx)).await?;
+        self.put_pieces(packets)?;
+        poll_fn(|cx| self.poll_flush(cx)).await
+    }
+
+    /// [`Writer::send_pieces`] for code that polls, taking the packets as [`Writer::poll_send`]
+    /// does.
+    pub fn poll_send_pieces<B: AsRef<[u8]>>(&mut self, cx: &mut Context<'_>, packets: &[Pieces<'_, B>]) -> Poll<io::Result<()>> {
+        ready!(self.poll_flush(cx))?;
+        Poll::Ready(self.put_pieces(packets))
+    }
+
+    /// [`Writer::send_pieces`] without waiting, as [`Writer::try_send`].
+    pub fn try_send_pieces<B: AsRef<[u8]>>(&mut self, packets: &[Pieces<'_, B>]) -> io::Result<()> {
+        self.try_flush()?;
+        self.put_pieces(packets)
+    }
+
+    /// [`Writer::send_pieces`], blocking the thread.
+    pub fn blocking_send_pieces<B: AsRef<[u8]>>(&mut self, packets: &[Pieces<'_, B>]) -> io::Result<()> {
+        self.blocking_flush()?;
+        self.put_pieces(packets)?;
+        self.blocking_flush()
+    }
+
     /// Writes one packet whose bytes come in pieces, such as a header and a payload, without
     /// joining them first. Its checksums are taken as they are.
     pub async fn send_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<()> {
@@ -709,6 +742,19 @@ impl<L: Layer> Writer<L> {
     fn put(&mut self, packets: &[Packet<'_>]) -> io::Result<()> {
         self.stats.packets += packets.len() as u64;
         self.plan.plan(&self.sink.takes(), packets)?;
+        self.put_planned(packets)
+    }
+
+    /// [`Writer::put`] for packets in pieces.
+    fn put_pieces<B: AsRef<[u8]>>(&mut self, packets: &[Pieces<'_, B>]) -> io::Result<()> {
+        self.stats.packets += packets.len() as u64;
+        self.plan.plan_parts(&self.sink.takes(), packets)?;
+        self.put_planned(packets)
+    }
+
+    /// Hands the device the writes that were planned for `packets` and keeps what it does not
+    /// take.
+    fn put_planned<P: Parts>(&mut self, packets: &[P]) -> io::Result<()> {
         let list = self.plan.writes(packets);
         let taken = self.sink.write(&list, &mut self.stats)?;
         if taken < list.count() {

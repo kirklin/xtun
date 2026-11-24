@@ -47,7 +47,7 @@ pub use device::Uring;
 #[cfg(windows)]
 pub use device::WintunLevel;
 pub use device::{Builder, Device, Offload, Tun};
-pub use xtun_wire::{Checksum, Frame, Gso, GsoKind, Packet, Segments, checksum};
+pub use xtun_wire::{Checksum, Frame, Gso, GsoKind, Packet, Pieces, Segments, checksum};
 pub use io::{Batch, Interrupt, Queue, Reader, ReaderStats, Writer, WriterStats};
 #[cfg(any(
     target_os = "linux",
