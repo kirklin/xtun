@@ -246,7 +246,7 @@ async fn through_reflector(offload: bool, mode: Mode, v6: bool) {
 #[ignore = "creates interfaces: run as root with --ignored"]
 async fn tcp_through_frames() {
     for v6 in [false, true] {
-        for mode in [Mode::Pass, Mode::Split, Mode::Packets, Mode::Pieces, Mode::Kept] {
+        for mode in [Mode::Pass, Mode::Split, Mode::Packets, Mode::Pieces, Mode::Kept, Mode::Mixed] {
             through_reflector(false, mode, v6).await;
         }
     }
@@ -257,7 +257,7 @@ async fn tcp_through_frames() {
 #[ignore = "creates interfaces: run as root with --ignored"]
 async fn tcp_through_frames_with_offload() {
     for v6 in [false, true] {
-        for mode in [Mode::Pass, Mode::Split, Mode::Packets, Mode::Pieces, Mode::Kept] {
+        for mode in [Mode::Pass, Mode::Split, Mode::Packets, Mode::Pieces, Mode::Kept, Mode::Mixed] {
             through_reflector(true, mode, v6).await;
         }
     }

@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use xtun::checksum::{Sum, pseudo_v4, pseudo_v6};
-use xtun::{Checksum, Layer, OwnedFrame, Packet, Pieces, Reader, Writer, WriterStats};
+use xtun::{Checksum, Gso, Layer, OwnedFrame, Packet, Pieces, Reader, Writer, WriterStats};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -222,6 +222,10 @@ pub enum Mode {
     /// Frames are taken out of their batches and queued, segments whole, the way a stack keeps
     /// what it received; what takes them from the queue writes each in pieces.
     Kept,
+    /// Frames longer than 512 bytes are taken out of their batches and the others stay, the way
+    /// a stack keeps payload and reads the rest where it lies; all go back as they were read,
+    /// in the order they came in.
+    Mixed,
 }
 
 fn octets(ip: IpAddr) -> Vec<u8> {
@@ -407,6 +411,53 @@ async fn write_kept<L: Layer>(writer: &mut Writer<L>, frames: Vec<OwnedFrame>, l
     writer.send_pieces(&packets).await
 }
 
+/// A frame of a batch that a reflector holds: taken out, or its bytes where they lie.
+enum Held<'a> {
+    Kept(OwnedFrame),
+    Left(&'a mut [u8], Checksum, Option<Gso>),
+}
+
+/// Reflects frames of which the long ones are taken out of their batches and the others stay,
+/// until reading or writing fails.
+async fn reflect_mixed<L: Layer>(mut reader: Reader<L>, mut writer: Writer<L>, nat: Nat, counters: Arc<Counters>) -> io::Result<()> {
+    loop {
+        let mut batch = reader.recv().await?;
+        let (read, mut taken) = (batch.len(), 0);
+        let mut held = Vec::with_capacity(read);
+        for frame in batch.frames() {
+            if frame.gso().is_some() {
+                counters.segments.fetch_add(1, Ordering::Relaxed);
+            }
+            let checksum = frame.checksum();
+            if frame.data().len() > 512 {
+                taken += 1;
+                let mut frame = frame.into_owned();
+                if rewrite(frame.data_mut(), checksum, &nat) {
+                    held.push(Held::Kept(frame));
+                }
+            } else {
+                let (gso, data) = (frame.gso(), frame.into_data());
+                if rewrite(data, checksum, &nat) {
+                    held.push(Held::Left(data, checksum, gso));
+                }
+            }
+        }
+        let packets: Vec<Packet<'_>> = held
+            .iter()
+            .map(|frame| match frame {
+                Held::Kept(frame) => frame.packet(),
+                Held::Left(data, checksum, gso) => Packet { data, checksum: *checksum, gso: *gso },
+            })
+            .collect();
+        let before = writer.stats();
+        writer.send(&packets).await?;
+        counters.wrote(before, writer.stats());
+        drop(packets);
+        drop(held);
+        assert_eq!(batch.len(), read - taken, "the frames that were not taken out are still in the batch");
+    }
+}
+
 /// Reflects until reading or writing fails.
 pub async fn reflect<L: Layer>(mut reader: Reader<L>, mut writer: Writer<L>, nat: Nat, mode: Mode, counters: Arc<Counters>) -> io::Result<()> {
     if mode == Mode::Packets {
@@ -414,6 +465,9 @@ pub async fn reflect<L: Layer>(mut reader: Reader<L>, mut writer: Writer<L>, nat
     }
     if mode == Mode::Kept {
         return reflect_kept(reader, writer, nat, counters).await;
+    }
+    if mode == Mode::Mixed {
+        return reflect_mixed(reader, writer, nat, counters).await;
     }
     let mut pool: Vec<(Vec<u8>, Checksum)> = Vec::new();
     loop {
@@ -467,7 +521,7 @@ pub async fn reflect<L: Layer>(mut reader: Reader<L>, mut writer: Writer<L>, nat
                     writer.send(&packets).await?;
                 }
             }
-            Mode::Packets | Mode::Kept => unreachable!("reflected by a function of its own"),
+            Mode::Packets | Mode::Kept | Mode::Mixed => unreachable!("reflected by a function of its own"),
         }
         counters.wrote(before, writer.stats());
     }

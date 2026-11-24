@@ -891,6 +891,13 @@ impl<'a> LentFrame<'a> {
         self.loan.block.map(|block| unsafe { block.as_ref() }.len())
     }
 
+    /// The bytes of the frame, which stays in its batch: they are lent for as long as the batch
+    /// is borrowed, so the bytes of every frame that stays can be held together while others
+    /// are taken out.
+    pub fn into_data(self) -> &'a mut [u8] {
+        self.frame.into_data()
+    }
+
     /// Takes the frame out of its batch, to live for as long as it is held.
     ///
     /// On Linux, Android, the BSDs and illumos, and for TUN interfaces on the Apple systems,

@@ -312,7 +312,7 @@ fn subnet(v6: bool, number: u8) -> (IpNet, [IpAddr; 3]) {
 #[ignore = "creates adapters: run with scripts/vm/windows.ts"]
 async fn wintun_tcp_through_the_device() {
     for v6 in [false, true] {
-        for mode in [Mode::Pass, Mode::Split, Mode::Packets, Mode::Pieces, Mode::Kept] {
+        for mode in [Mode::Pass, Mode::Split, Mode::Packets, Mode::Pieces, Mode::Kept, Mode::Mixed] {
             let (address, [local, peer, other]) = subnet(v6, 175);
             let (_device, queues) = tun("xtuntest4").mtu(1500).address(address).build().unwrap();
             through_reflector(queues, Nat { local, peer, other, link: 0 }, mode).await;
@@ -324,7 +324,7 @@ async fn wintun_tcp_through_the_device() {
 #[ignore = "creates adapters: run with scripts/vm/windows.ts"]
 async fn tap_tcp_through_frames() {
     for v6 in [false, true] {
-        for mode in [Mode::Pass, Mode::Split, Mode::Packets, Mode::Pieces, Mode::Kept] {
+        for mode in [Mode::Pass, Mode::Split, Mode::Packets, Mode::Pieces, Mode::Kept, Mode::Mixed] {
             let (address, [local, peer, other]) = subnet(v6, 176);
             let (device, queues) = tap("xtuntap1").address(address).build().unwrap();
             neighbors(&device, &[&peer.to_string(), &other.to_string()]);
