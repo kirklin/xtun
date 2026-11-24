@@ -18,6 +18,11 @@ on:
     # Every Monday: the machines, the images and the packages move on without a commit here.
     - cron: "23 4 * * 1"
   workflow_dispatch:
+    inputs:
+      jobs:
+        description: "Only these jobs, separated by spaces: linux linux-kernel macos ios windows bsd android. All of them when empty."
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -36,6 +41,7 @@ env:
 jobs:
   linux:
     name: linux (${{ matrix.os }})
+    if: inputs.jobs == '' || contains(format(' {0} ', inputs.jobs), ' linux ')
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -69,6 +75,7 @@ jobs:
   # and run in a virtual machine of each distribution, which needs no toolchain for them.
   linux-kernel:
     name: linux kernel (${{ matrix.guest }})
+    if: inputs.jobs == '' || contains(format(' {0} ', inputs.jobs), ' linux-kernel ')
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     strategy:
@@ -123,6 +130,7 @@ jobs:
 
   macos:
     name: macos (${{ matrix.os }})
+    if: inputs.jobs == '' || contains(format(' {0} ', inputs.jobs), ' macos ')
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -154,6 +162,7 @@ jobs:
   # the device tests as programs of that runtime.
   ios:
     name: ios (${{ matrix.os }})
+    if: inputs.jobs == '' || contains(format(' {0} ', inputs.jobs), ' ios ')
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
@@ -168,6 +177,13 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component rust-src --no-self-update
           rustup default stable
+      # `scripts/ios.ts` takes cargo from `~/.cargo/bin`, where rustup has it on a developer's Mac.
+      - name: The tools where the script looks for them
+        run: |
+          mkdir -p "$HOME/.cargo/bin"
+          for tool in cargo rustc rustup; do
+            [ -e "$HOME/.cargo/bin/$tool" ] || ln -s "$(command -v "$tool")" "$HOME/.cargo/bin/$tool"
+          done
       - name: System
         run: sw_vers && xcodebuild -version && node --version && rustc --version
       - name: Unit tests and device tests
@@ -175,6 +191,7 @@ jobs:
 
   windows:
     name: windows (${{ matrix.os }})
+    if: inputs.jobs == '' || contains(format(' {0} ', inputs.jobs), ' windows ')
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     strategy:
@@ -203,9 +220,12 @@ jobs:
           -- --ignored --test-threads=1 --nocapture
 
   # FreeBSD, NetBSD, OpenBSD and illumos in virtual machines. OpenBSD has no Rust but its own
-  # package's, which is too old for the workspace before 7.8. illumos has no TAP devices here.
+  # package's, which is too old for the workspace before 7.8. NetBSD has none before 10: what
+  # rustup installs needs the C library of NetBSD 10, and pkgsrc builds no packages for NetBSD 9
+  # any more. illumos has no TAP devices here.
   bsd:
     name: ${{ matrix.system }} ${{ matrix.version }}
+    if: inputs.jobs == '' || contains(format(' {0} ', inputs.jobs), ' bsd ')
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
@@ -215,7 +235,6 @@ jobs:
           - { system: freebsd, version: "13.5", tests: --test device --test tap }
           - { system: freebsd, version: "14.5", tests: --test device --test tap }
           - { system: freebsd, version: "15.1", tests: --test device --test tap }
-          - { system: netbsd, version: "9.5", tests: --test device --test tap }
           - { system: netbsd, version: "10.2", tests: --test device --test tap }
           - { system: netbsd, version: "11.1", tests: --test device --test tap }
           - { system: openbsd, version: "7.8", tests: --test device --test tap }
@@ -236,43 +255,59 @@ jobs:
           shell: sh
           sync_files: runner-to-vm
           environment_variables: CARGO_TERM_COLOR
+      # What the steps that follow need in their environment goes into `~/environment`.
       - name: Rust
         shell: cpa.sh {0} --sync-files runner-to-vm
         run: |
           set -eu
+          : > "$HOME/environment"
           case "$(uname -s)" in
             OpenBSD) sudo pkg_add rust ;;
             SunOS) sudo pkg install ooce/developer/rust driver/tuntap ;;
-            *) curl --proto '=https' --tlsv1.2 --fail --silent --show-error https://sh.rustup.rs | sh -s -- -y --profile minimal ;;
+            *)
+              curl --proto '=https' --tlsv1.2 --fail --silent --show-error --output "$HOME/rustup-init.sh" https://sh.rustup.rs
+              sh "$HOME/rustup-init.sh" -y --profile minimal
+              echo '. "$HOME/.cargo/env"' >> "$HOME/environment"
+              ;;
           esac
+      # FreeBSD's devd starts a DHCP client on every Ethernet interface that appears, the TAP
+      # interfaces of the tests among them: the client gives the interface an address of its own
+      # and empties the system's table of neighbors under the test.
       - name: System
         shell: cpa.sh {0} --sync-files none
         run: |
-          if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi
-          uname -a && rustc --version && cc --version
+          . "$HOME/environment"
+          uname -a && rustc --version
+          if [ "$(uname -s)" = FreeBSD ]; then sudo service devd onestop; fi
       - name: Unit tests
         shell: cpa.sh {0} --sync-files none
         run: |
-          if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi
+          . "$HOME/environment"
           cargo test --release --locked -p xtun-wire --lib
       - name: Device tests
         shell: cpa.sh {0} --sync-files none
         run: |
-          if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi
+          . "$HOME/environment"
           cargo test --release --locked --no-fail-fast --features async-io,futures ${{ matrix.tests }} \
             --config "target.'cfg(unix)'.runner = '$PWD/scripts/ci/root.sh'" \
             -- --ignored --test-threads=1 --nocapture
 
-  # `scripts/android.ts` makes its virtual device from the newest system image the SDK has, which
-  # is the one of the job's API level, and runs the tests in it as root.
+  # `scripts/android.ts` runs the tests as root in the emulator it finds running on its port. The
+  # job starts that emulator, from the system image of its API level. On GitHub's machines the
+  # tool that makes virtual devices and the emulator look for them in different directories
+  # unless they are told one. API level 29, Android 10, is the oldest whose emulator passes the
+  # tests.
   android:
     name: android (api ${{ matrix.api }})
+    if: inputs.jobs == '' || contains(format(' {0} ', inputs.jobs), ' android ')
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    env:
+      ANDROID_AVD_HOME: /home/runner/.android/avd
     strategy:
       fail-fast: false
       matrix:
-        api: [24, 30, 34, 36]
+        api: [29, 30, 34, 36]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Rust
@@ -286,6 +321,23 @@ jobs:
           sdkmanager="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
           yes | "$sdkmanager" --licenses > /dev/null || true
           "$sdkmanager" --install emulator platform-tools "system-images;android-${{ matrix.api }};google_apis;x86_64" > /dev/null
-          ls "$ANDROID_HOME/system-images" "$ANDROID_HOME/ndk"
+      # The name of the virtual device and the port are those of `scripts/android.ts`.
+      - name: Start the emulator
+        run: |
+          mkdir -p "$ANDROID_AVD_HOME"
+          echo no | "$ANDROID_HOME/cmdline-tools/latest/bin/avdmanager" create avd --name xtun_test \
+            --package "system-images;android-${{ matrix.api }};google_apis;x86_64" --device pixel_6
+          nohup "$ANDROID_HOME/emulator/emulator" -avd xtun_test -port 5584 \
+            -no-window -no-audio -no-boot-anim -no-snapshot \
+            > "$RUNNER_TEMP/emulator.log" 2>&1 &
+          adb="$ANDROID_HOME/platform-tools/adb"
+          for _ in $(seq 1 120); do
+            if [ "$("$adb" -s emulator-5584 shell getprop sys.boot_completed 2> /dev/null | tr -d '\r')" = 1 ]; then
+              exit 0
+            fi
+            sleep 5
+          done
+          cat "$RUNNER_TEMP/emulator.log"
+          exit 1
       - name: Unit tests and device tests
-        run: node --version && node scripts/android.ts
+        run: node scripts/android.ts
