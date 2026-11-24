@@ -385,6 +385,28 @@ async fn tcp_through_four_queues() {
     through_reflector(true, Mode::Mixed, true, 4, uring_here()).await;
 }
 
+/// A program that makes an interface right after another went away gets one. FreeBSD frees the
+/// unit of a TUN interface that goes before its device is gone, and a device that is going may
+/// still be handed out for a moment.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "creates interfaces: run as root with --ignored"]
+async fn interfaces_are_made_one_right_after_another() {
+    for round in 0..50u64 {
+        let made = Tun::builder().address(net("10.74.9.1/24")).build();
+        let (device, queues) = made.unwrap_or_else(|error| panic!("interface {round}: {error}"));
+        // As in a program whose tasks hold the queues: they go a moment after the device, and
+        // the next interface may be made before or after.
+        let later = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(round % 3));
+            drop(queues);
+        });
+        drop(device);
+        if round % 2 == 0 {
+            later.join().unwrap();
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "creates interfaces: run as root with --ignored"]
 async fn a_device_hands_out_its_queues_once() {

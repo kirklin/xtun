@@ -391,6 +391,7 @@ fn claim(ethernet: bool, name: &str, reuse: bool) -> Result<bool> {
 }
 
 /// Opens the device node of the interface called `name`.
+#[cfg(any(target_os = "netbsd", target_os = "openbsd"))]
 fn open_device(name: &str) -> Result<OwnedFd> {
     open_node(&format!("/dev/{name}")).map_err(|error| Error::new(error.kind(), format!("opening /dev/{name}: {error}")))
 }
@@ -428,6 +429,28 @@ fn destroy_interface(name: &str) -> Result<()> {
     ioctl(libc::AF_INET, os::SIOCIFDESTROY, &mut request)
 }
 
+/// FreeBSD: how long a device node that is going away may still be handed out.
+#[cfg(target_os = "freebsd")]
+const GOING: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// FreeBSD: opens the device node at `path`, the cloning device or the device of one unit. When
+/// an interface of the kind has just gone away, the system has freed its unit before the
+/// deferred destruction of its device has finished, and a lookup may still find the device
+/// that is going: opening it fails with ENXIO, and a moment later it is gone and the lookup
+/// makes a new one.
+#[cfg(target_os = "freebsd")]
+fn open_settled(path: &str) -> Result<OwnedFd> {
+    let deadline = std::time::Instant::now() + GOING;
+    loop {
+        match open_node(path) {
+            Err(error) if error.raw_os_error() == Some(libc::ENXIO) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            result => return result.map_err(|error| Error::new(error.kind(), format!("opening {path}: {error}"))),
+        }
+    }
+}
+
 /// FreeBSD: the cloning devices hand out a new interface each; one opened by name stays, unless
 /// it is transient (FreeBSD 15).
 #[cfg(target_os = "freebsd")]
@@ -436,12 +459,9 @@ fn open(ethernet: bool, name: Option<&str>, reuse: bool, _persist: bool) -> Resu
         // The system creates the interface when its device node is looked up.
         Some(name) => {
             let existed = claim(ethernet, name, reuse)?;
-            (open_device(name)?, existed)
+            (open_settled(&format!("/dev/{name}"))?, existed)
         }
-        None => {
-            let cloner = if ethernet { os::TAP_CLONER } else { os::TUN_CLONER };
-            (open_node(cloner).map_err(|error| Error::new(error.kind(), format!("opening {cloner}: {error}")))?, false)
-        }
+        None => (open_settled(if ethernet { os::TAP_CLONER } else { os::TUN_CLONER })?, false),
     };
     let name = fd_name(fd.as_raw_fd())?;
     // An interface that was there before stays, as a persistent interface does on Linux, until
