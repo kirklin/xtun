@@ -30,6 +30,39 @@ async fn example() -> std::io::Result<()> {
 
 Every read and write comes as an `async` method, a `poll_` method, a `try_` method that never waits and a `blocking_` method that needs no runtime. `Device::from_fd` wraps a descriptor that something else opened, such as the one Android or an iOS packet tunnel hands to an application.
 
+## Frames that stay, packets in pieces
+
+The frames of a batch are lent: they live in the reader's memory until the batch is dropped, which suits a program that writes them out again at once. A program that keeps what it reads, as a TCP/IP stack keeps payload until its application asks for it, takes a frame out of the batch with `LentFrame::into_owned`. The `OwnedFrame` lives until it is dropped, on any thread. On Linux, Android, the BSDs and illumos, and for TUN interfaces on macOS and iOS, no byte is copied: the frame keeps the block of memory it was read into, about 64 KiB, and the reader reads on into another block, one that an earlier frame gave back. On Windows, and for TAP interfaces on macOS, a frame is no longer than the MTU and lies in memory that goes back to the driver or holds other frames too: it is copied. `LentFrame::block_len` tells the two apart before a frame is taken, and says how much memory the frame will hold. With the `bytes` feature an owned frame turns into `Bytes`.
+
+What such a program sends is headers it has just made and payload that lies somewhere else. `Writer::send_pieces` takes each packet as a head and the pieces behind it, of any type that holds bytes, and does with them what `send` does with packets, joining runs of a flow into segments, cutting segments and completing checksums, without putting their bytes together first.
+
+```rust
+async fn example(reader: &mut xtun::Reader, writer: &mut xtun::Writer) -> std::io::Result<()> {
+    let mut kept = Vec::new();
+    let mut batch = reader.recv().await?;
+    for frame in batch.frames() {
+        // A long frame is kept as it lies; a short one is cheaper to copy than to hold a block for.
+        if frame.data().len() >= 4096 {
+            kept.push(frame.into_owned());
+        }
+    }
+    drop(batch);
+
+    let packets: Vec<_> = kept
+        .iter()
+        .map(|frame| {
+            let (head, payload) = frame.data().split_at(40);
+            (head, [payload], frame.checksum(), frame.gso())
+        })
+        .collect();
+    let pieces: Vec<_> = packets
+        .iter()
+        .map(|(head, body, checksum, gso)| xtun::Pieces { head, body, checksum: *checksum, gso: *gso })
+        .collect();
+    writer.send_pieces(&pieces).await
+}
+```
+
 ## Systems
 
 ![One interface, nine systems](assets/systems.svg)
@@ -46,7 +79,7 @@ Every read and write comes as an `async` method, a `poll_` method, a `try_` meth
 | illumos | STREAMS `tun` driver | | |
 | Windows | Wintun | TAP-Windows6 | |
 
-The `tokio` feature, on by default, runs the asynchronous calls on Tokio; `async-io` runs them on the reactor of smol and async-std; `futures` adds `PacketStream` and `PacketSink`.
+The `tokio` feature, on by default, runs the asynchronous calls on Tokio; `async-io` runs them on the reactor of smol and async-std; `bytes` turns an `OwnedFrame` into `Bytes`; `futures` adds `PacketStream` and `PacketSink`.
 
 ## Architecture
 
