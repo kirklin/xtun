@@ -1,0 +1,74 @@
+# Publishes the crates to crates.io when a tag `v<version>` is pushed, `<version>` being the
+# version of xtun. xtun-wire goes first, as xtun depends on it; a crate whose version is on
+# crates.io already is left as it is, so a release of xtun alone publishes xtun alone.
+#
+# Nothing is published from a commit that the tests have not passed on: the run of `ci.yml` that
+# the push of the commit to main started has to have succeeded.
+#
+# crates.io trusts this workflow, in the environment `crates-io`, to publish both crates, and
+# hands it a token that lives for 30 minutes. No token of anyone's is kept in the repository.
+
+name: publish
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    environment: crates-io
+    permissions:
+      # The commit, and the runs of `ci.yml` on it.
+      contents: read
+      actions: read
+      # The proof of the workflow's identity that crates.io trades for a token.
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Rust
+        run: rustup toolchain install stable --profile minimal --no-self-update && rustup default stable
+      - name: The tag names the version of xtun
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "xtun") | .version')"
+          if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::the tag is $GITHUB_REF_NAME and xtun is at $version"
+            exit 1
+          fi
+      - name: The tests passed on the tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          passed="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml --event push --commit "$GITHUB_SHA" \
+            --json conclusion --jq 'map(select(.conclusion == "success")) | length')"
+          if [ "$passed" = 0 ]; then
+            echo "::error::no run of ci.yml has passed on $GITHUB_SHA; push it to main and let the tests pass first"
+            exit 1
+          fi
+      - uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+        id: auth
+      - name: Publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: |
+          metadata="$(cargo metadata --no-deps --format-version 1)"
+          for crate in xtun-wire xtun; do
+            version="$(jq -r --arg crate "$crate" '.packages[] | select(.name == $crate) | .version' <<< "$metadata")"
+            status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+              --header "User-Agent: xtun-publish (https://github.com/$GITHUB_REPOSITORY)" \
+              "https://crates.io/api/v1/crates/$crate/$version")"
+            case "$status" in
+              200) echo "$crate $version is on crates.io already" ;;
+              404) cargo publish --locked -p "$crate" ;;
+              *) echo "::error::crates.io answered $status for $crate $version"; exit 1 ;;
+            esac
+          done
