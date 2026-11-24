@@ -15,7 +15,7 @@ use io_uring::{IoUring, opcode, squeue, types};
 use super::kernel_version;
 use crate::device::{Options, Uring};
 use crate::io::{Filled, ReaderStats, WriterStats};
-use crate::sys::unix::transport::{BATCH_BYTES, Each, Gathered, IoVecs, Read, SLOT, Write, Wrote, nothing, read_each, wrote};
+use crate::sys::unix::transport::{BATCH_BYTES, Each, Found, Gathered, IoVecs, Read, Slots, Write, Wrote, nothing, read_each, wrote};
 
 /// The position argument that means "no position" for a stream such as a TUN device.
 const NO_OFFSET: u64 = u64::MAX;
@@ -70,10 +70,10 @@ impl Reads {
 }
 
 impl Read for Reads {
-    fn read(&mut self, fd: RawFd, buffer: &mut [u8], frames: usize, stats: &mut ReaderStats, frame: impl FnMut(&mut [u8])) -> Filled {
+    fn read(&mut self, fd: RawFd, slots: &mut Slots, frames: usize, stats: &mut ReaderStats, frame: impl FnMut(Found<'_>)) -> Filled {
         match &mut self.ring {
-            Some(ring) => ring.read(fd, buffer, stats, frame),
-            None => Each.read(fd, buffer, frames, stats, frame),
+            Some(ring) => ring.read(fd, slots, stats, frame),
+            None => Each.read(fd, slots, frames, stats, frame),
         }
     }
 }
@@ -92,18 +92,18 @@ impl ReadRing {
         Ok(ReadRing { ring: IoUring::new(frames.next_power_of_two() as u32)?, frames, want: 1, results: vec![0; frames] })
     }
 
-    fn read(&mut self, fd: RawFd, buffer: &mut [u8], stats: &mut ReaderStats, mut frame: impl FnMut(&mut [u8])) -> Filled {
+    fn read(&mut self, fd: RawFd, slots: &mut Slots, stats: &mut ReaderStats, mut frame: impl FnMut(Found<'_>)) -> Filled {
         if self.want < RING_FRAMES || self.frames < RING_FRAMES {
-            let (filled, read) = read_each(fd, buffer, 0, self.frames, stats, frame);
+            let (filled, read) = read_each(fd, slots, 0, self.frames, stats, frame);
             self.want = if filled.dry { read } else { read * 2 };
             return filled;
         }
         // One frame with a plain system call, which also finds an empty queue the cheapest way,
         // and the rest of the batch through the ring.
         let mut first = 0;
-        let (filled, read) = read_each(fd, buffer, 0, 1, stats, |raw| {
-            first = raw.len();
-            frame(raw);
+        let (filled, read) = read_each(fd, slots, 0, 1, stats, |found| {
+            first = found.bytes.len();
+            frame(found);
         });
         if read == 0 {
             return filled;
@@ -112,13 +112,13 @@ impl ReadRing {
         {
             let mut queue = self.ring.submission();
             for index in 0..want {
-                let room = buffer[(index + 1) * SLOT..(index + 2) * SLOT].as_mut_ptr();
-                let entry = opcode::Read::new(types::Fd(fd), room, SLOT as u32)
+                let room = slots.room(index + 1);
+                let entry = opcode::Read::new(types::Fd(fd), room.as_mut_ptr(), room.len() as u32)
                     .offset(NO_OFFSET)
                     .rw_flags(libc::RWF_NOWAIT)
                     .build()
                     .user_data(index as u64);
-                // SAFETY: the buffer outlives the call below, which completes every request.
+                // SAFETY: the slots outlive the call below, which completes every request.
                 unsafe { queue.push(&entry).expect("the ring holds a whole batch") };
             }
         }
@@ -135,7 +135,7 @@ impl ReadRing {
             match *result {
                 length if length > 0 => {
                     let length = length as usize;
-                    frame(&mut buffer[(index + 1) * SLOT..(index + 1) * SLOT + length]);
+                    frame(slots.filled(index + 1, length));
                     read += 1;
                     bytes += length;
                 }

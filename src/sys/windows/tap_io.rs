@@ -18,7 +18,7 @@ use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED
 
 use super::tap::Tap;
 use super::wait::{Event, Signal, Watch, wait};
-use crate::io::{Filled, Lent, ReaderStats, Wait, WriterStats};
+use crate::io::{Filled, Loan, ReaderStats, Wait, WriterStats};
 
 /// Room around the Ethernet payload the driver carries: the Ethernet header and one VLAN tag.
 const FRAME_OVERHEAD: usize = 14 + 4;
@@ -134,7 +134,7 @@ impl Source {
 
     /// Posts again the reads whose frames were handed out, then collects the reads that
     /// finished, in the order they were posted.
-    fn refill(&mut self, frames: &mut Vec<Lent>, stats: &mut ReaderStats) -> Filled {
+    fn refill(&mut self, frames: &mut Vec<Loan>, stats: &mut ReaderStats) -> Filled {
         let count = self.reads.len();
         while self.collected > 0 {
             if let Err(error) = self.post(self.next) {
@@ -157,7 +157,7 @@ impl Source {
             self.collected += 1;
             let raw = &mut read.buffer[..length];
             match FRAMING.decode(raw) {
-                Some(decoded) => frames.push(Lent::new(raw, decoded)),
+                Some(decoded) => frames.push(Loan::new(raw, decoded, None)),
                 None => stats.malformed += 1,
             }
         }
@@ -186,7 +186,7 @@ impl Wait for Source {
 // A buffer goes back to the driver only when the source fills again and posts its read anew,
 // and is freed only when the source is dropped, after the reads that still run were cancelled.
 unsafe impl crate::io::Source for Source {
-    fn fill(&mut self, frames: &mut Vec<Lent>, stats: &mut ReaderStats) -> Filled {
+    fn fill(&mut self, frames: &mut Vec<Loan>, stats: &mut ReaderStats) -> Filled {
         let filled = self.refill(frames, stats);
         stats.calls += std::mem::take(&mut self.calls);
         filled

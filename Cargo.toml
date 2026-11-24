@@ -14,8 +14,10 @@ default = ["tokio"]
 tokio = ["dep:tokio"]
 # Asynchronous reads and writes on async-io, the reactor of smol and async-std.
 async-io = ["dep:async-io"]
+# Frames taken out of a batch as `Bytes`.
+bytes = ["dep:bytes"]
 # Readers as streams of packets and writers as sinks of packets.
-futures = ["dep:bytes", "dep:futures-core", "dep:futures-sink"]
+futures = ["bytes", "dep:futures-core", "dep:futures-sink"]
 
 [dependencies]
 xtun-wire = { path = "wire" }

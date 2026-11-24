@@ -11,7 +11,7 @@ use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, ERROR_HANDLE_EOF, ER
 
 use super::tunnel::{Session, Tun};
 use super::wait::{Keep, Signal, Timer, Watch, signalled, wait};
-use crate::io::{Filled, Lent, ReaderStats, Wait, WriterStats};
+use crate::io::{Filled, Loan, ReaderStats, Wait, WriterStats};
 
 /// The largest packet Wintun moves.
 const MAX_PACKET: usize = 0xffff;
@@ -98,7 +98,7 @@ impl Wait for Source {
 // again, in `release` for the frames it covers, and when the source is dropped.
 unsafe impl crate::io::Source for Source {
     /// Takes the packets in the ring, up to the capacity, without copying them.
-    fn fill(&mut self, frames: &mut Vec<Lent>, stats: &mut ReaderStats) -> Filled {
+    fn fill(&mut self, frames: &mut Vec<Loan>, stats: &mut ReaderStats) -> Filled {
         self.give_back(self.held.0.len());
         self.held.0.clear();
         self.given_back = 0;
@@ -125,7 +125,7 @@ unsafe impl crate::io::Source for Source {
             let raw = unsafe { std::slice::from_raw_parts_mut(packet, size as usize) };
             match FRAMING.decode(raw) {
                 Some(decoded) => {
-                    frames.push(Lent::new(raw, decoded));
+                    frames.push(Loan::new(raw, decoded, None));
                     self.held.0.push(packet);
                 }
                 None => {

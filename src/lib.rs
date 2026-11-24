@@ -24,7 +24,41 @@
 //! }
 //! # }
 //! ```
+//!
+//! The frames of a batch are lent until the batch is dropped. A program that keeps what it
+//! reads takes a frame out of its batch with [`LentFrame::into_owned`], which copies nothing
+//! where the reader has read the frame into a block of its own, and a program whose packets are
+//! headers it made and payload that lies elsewhere writes them with [`Writer::send_pieces`]:
+//!
+//! ```no_run
+//! # async fn example(reader: &mut xtun::Reader, writer: &mut xtun::Writer) -> std::io::Result<()> {
+//! let mut kept = Vec::new();
+//! let mut batch = reader.recv().await?;
+//! for frame in batch.frames() {
+//!     // A long frame is kept as it lies; a short one is cheaper to copy than to hold a block for.
+//!     if frame.data().len() >= 4096 {
+//!         kept.push(frame.into_owned());
+//!     }
+//! }
+//! drop(batch);
+//!
+//! let packets: Vec<_> = kept
+//!     .iter()
+//!     .map(|frame| {
+//!         let (head, payload) = frame.data().split_at(40);
+//!         (head, [payload], frame.checksum(), frame.gso())
+//!     })
+//!     .collect();
+//! let pieces: Vec<_> = packets
+//!     .iter()
+//!     .map(|(head, body, checksum, gso)| xtun::Pieces { head, body, checksum: *checksum, gso: *gso })
+//!     .collect();
+//! writer.send_pieces(&pieces).await
+//! # }
+//! ```
 
+#[cfg_attr(not(unix), allow(dead_code))]
+mod block;
 mod device;
 mod io;
 mod layer;
@@ -48,7 +82,7 @@ pub use device::Uring;
 pub use device::WintunLevel;
 pub use device::{Builder, Device, Offload, Tun};
 pub use xtun_wire::{Checksum, Frame, Gso, GsoKind, Packet, Pieces, Segments, checksum};
-pub use io::{Batch, Interrupt, Queue, Reader, ReaderStats, Writer, WriterStats};
+pub use io::{Batch, Interrupt, LentFrame, OwnedFrame, Queue, Reader, ReaderStats, Writer, WriterStats};
 #[cfg(any(
     target_os = "linux",
     target_os = "android",

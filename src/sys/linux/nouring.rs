@@ -8,7 +8,7 @@ use xtun_wire::Writes as List;
 
 use crate::device::Options;
 use crate::io::{Filled, ReaderStats, WriterStats};
-use crate::sys::unix::transport::{Each, Gathered, Read, Write};
+use crate::sys::unix::transport::{Each, Found, Gathered, Read, Slots, Write};
 
 pub(super) fn choose(options: &Options) -> Result<bool> {
     #[cfg(target_os = "linux")]
@@ -33,8 +33,8 @@ impl Reads {
 }
 
 impl Read for Reads {
-    fn read(&mut self, fd: RawFd, buffer: &mut [u8], frames: usize, stats: &mut ReaderStats, frame: impl FnMut(&mut [u8])) -> Filled {
-        self.0.read(fd, buffer, frames, stats, frame)
+    fn read(&mut self, fd: RawFd, slots: &mut Slots, frames: usize, stats: &mut ReaderStats, frame: impl FnMut(Found<'_>)) -> Filled {
+        self.0.read(fd, slots, frames, stats, frame)
     }
 }
 

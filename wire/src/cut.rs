@@ -343,6 +343,11 @@ impl<'a> Frame<'a> {
         self.data
     }
 
+    /// The bytes, for as long as they were lent to the frame.
+    pub fn into_data(self) -> &'a mut [u8] {
+        self.data
+    }
+
     /// How far the transport checksum is done.
     pub fn checksum(&self) -> Checksum {
         self.checksum
@@ -374,6 +379,11 @@ impl<'a> Frame<'a> {
     /// Cutting happens in the frame's buffer, so each packet has to be done with before the next
     /// one is taken.
     pub fn segments(&mut self) -> Segments<'_> {
+        Frame { data: &mut *self.data, link: self.link, checksum: self.checksum, gso: self.gso }.into_segments()
+    }
+
+    /// [`Frame::segments`] for as long as the bytes were lent to the frame.
+    pub fn into_segments(self) -> Segments<'a> {
         let cut = self.gso.map(|gso| {
             let cut = Cut::new(self.data, self.link, self.checksum, gso);
             let mut template = [0u8; MAX_HEADER];

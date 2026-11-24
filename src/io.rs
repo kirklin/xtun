@@ -11,8 +11,9 @@ use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 use std::time::{Duration, Instant};
 
-use xtun_wire::{Checksum, Decoded, Frame, Gso, Packet, Parts, Pieces, Plan, Takes, Writes, take_first};
+use xtun_wire::{Checksum, Decoded, Frame, Gso, Packet, Parts, Pieces, Plan, Segments, Takes, Writes, take_first};
 
+use crate::block::Block;
 use crate::layer::{Ip, Layer};
 use crate::sys::{self, Tunnel};
 
@@ -36,24 +37,34 @@ pub trait Wait {
 }
 
 /// A frame in the memory of a [`Source`], lent to the reader.
-pub struct Lent {
+pub struct Loan {
     data: NonNull<u8>,
     len: usize,
     link: usize,
     checksum: Checksum,
     gso: Option<Gso>,
+    /// The block the frame lies in, where it has one to itself. The source holds the block for
+    /// as long as the frame is lent.
+    block: Option<NonNull<Block>>,
+    /// The frame was taken out of its batch.
+    taken: bool,
 }
 
 // SAFETY: a lent frame is a stretch of memory that only the reader touches while it is lent.
-unsafe impl Send for Lent {}
-// SAFETY: as above; shared access never reads through the pointer.
-unsafe impl Sync for Lent {}
+unsafe impl Send for Loan {}
+// SAFETY: as above; shared access never reads through the pointers.
+unsafe impl Sync for Loan {}
 
-impl Lent {
-    /// The frame that [`xtun_wire::Framing::decode`] found in `raw`.
-    pub fn new(raw: &mut [u8], decoded: Decoded) -> Lent {
+impl Loan {
+    /// The frame that [`xtun_wire::Framing::decode`] found in `raw`. `block` is the block that
+    /// `raw` lies in, if it is the only frame there and the source holds the block until it
+    /// fills again; without one the frame lies in memory that holds other frames too, or that
+    /// the source cannot part with.
+    pub fn new(raw: &mut [u8], decoded: Decoded, block: Option<&Arc<Block>>) -> Loan {
         let frame = &mut raw[decoded.start..decoded.start + decoded.len];
-        Lent { data: NonNull::from(frame).cast(), len: decoded.len, link: decoded.link, checksum: decoded.checksum, gso: decoded.gso }
+        let data = NonNull::from(frame).cast();
+        let block = block.map(|block| NonNull::from(&**block));
+        Loan { data, len: decoded.len, link: decoded.link, checksum: decoded.checksum, gso: decoded.gso, block, taken: false }
     }
 
     /// # Safety
@@ -101,7 +112,7 @@ impl Filled {
 pub unsafe trait Source: Wait + Send {
     /// Reads the frames that are ready into the source's own memory, without waiting, and lists
     /// them in order. Frames lent before are done with.
-    fn fill(&mut self, frames: &mut Vec<Lent>, stats: &mut ReaderStats) -> Filled;
+    fn fill(&mut self, frames: &mut Vec<Loan>, stats: &mut ReaderStats) -> Filled;
 
     /// The first `upto` frames of the last fill are done with. A source that lends memory of
     /// its driver gives it back here.
@@ -341,7 +352,7 @@ impl<L: Layer> fmt::Debug for Queue<L> {
 pub struct Reader<L: Layer = Ip> {
     source: <L::Tunnel as Tunnel>::Source,
     /// The frames of the last read.
-    lent: Vec<Lent>,
+    lent: Vec<Loan>,
     /// The first frame that has not been handed out.
     next: usize,
     /// An error met after some frames had been read, reported once they are handed out.
@@ -370,14 +381,43 @@ pub struct Writer<L: Layer = Ip> {
     stats: WriterStats,
 }
 
-/// The frames of one read. They live in the reader's buffers, or on Windows in the driver's,
-/// until the batch is dropped.
+/// The frames of one read. They live in the reader's memory, or on Windows in the driver's,
+/// until the batch is dropped; a frame that is to live longer is taken out of the batch with
+/// [`LentFrame::into_owned`].
 pub struct Batch<'a> {
     source: &'a mut dyn Source,
-    lent: &'a mut [Lent],
+    lent: &'a mut [Loan],
     /// How many frames of the read came before these.
     first: usize,
 }
+
+/// A frame of a [`Batch`], lent by the reader. It is used where it lies, as the [`Frame`] it
+/// dereferences to, or taken out of the batch to be kept.
+pub struct LentFrame<'a> {
+    frame: Frame<'a>,
+    loan: &'a mut Loan,
+}
+
+/// A frame that was taken out of its [`Batch`] with [`LentFrame::into_owned`]: it lives until
+/// it is dropped, on whatever thread, whatever becomes of the reader and its device.
+///
+/// Where the reader had read the frame into a block of its own, the frame keeps that block,
+/// about 64 KiB whatever the frame's length, and gives it back to the reader when it is dropped.
+pub struct OwnedFrame {
+    data: NonNull<u8>,
+    len: usize,
+    link: usize,
+    checksum: Checksum,
+    gso: Option<Gso>,
+    /// The block the bytes lie in; without one they are an allocation of their own.
+    block: Option<Arc<Block>>,
+}
+
+// SAFETY: the bytes belong to the frame alone: a block the reader no longer touches, or an
+// allocation of the frame's own.
+unsafe impl Send for OwnedFrame {}
+// SAFETY: as above; shared access only reads the bytes.
+unsafe impl Sync for OwnedFrame {}
 
 /// What a reader has done so far.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -818,25 +858,162 @@ impl<L: Layer> Writer<L> {
 }
 
 impl Batch<'_> {
-    /// How many frames there are.
+    /// How many frames there are: those of the read that have not been taken out.
     pub fn len(&self) -> usize {
-        self.lent.len()
+        self.lent.iter().filter(|loan| !loan.taken).count()
     }
 
     /// Whether there is no frame.
     pub fn is_empty(&self) -> bool {
-        self.lent.is_empty()
+        self.len() == 0
     }
 
-    /// The frames, in the order they were read.
-    pub fn frames(&mut self) -> impl Iterator<Item = Frame<'_>> {
-        self.lent.iter_mut().map(|frame| {
+    /// The frames, in the order they were read. Each is lent for as long as the batch lives,
+    /// and stays in the batch unless it is taken out with [`LentFrame::into_owned`].
+    pub fn frames(&mut self) -> impl Iterator<Item = LentFrame<'_>> {
+        self.lent.iter_mut().filter(|loan| !loan.taken).map(|loan| {
             // SAFETY: the source has not read again since it lent the frames, each lies apart
-            // from the others, and the batch, borrowed for as long as the frame lives, is the
-            // only way to them.
-            let bytes = unsafe { frame.bytes() };
-            Frame::trusted(bytes, frame.link, frame.checksum, frame.gso)
+            // from the others, none of these was taken out, and the batch, borrowed for as
+            // long as the frame lives, is the only way to them.
+            let bytes = unsafe { loan.bytes() };
+            LentFrame { frame: Frame::trusted(bytes, loan.link, loan.checksum, loan.gso), loan }
         })
+    }
+}
+
+impl<'a> LentFrame<'a> {
+    /// How many bytes the block has that the frame lies in alone: a frame that is taken out of
+    /// its batch keeps that block, so [`LentFrame::into_owned`] copies nothing and the frame
+    /// holds this much memory, whatever its own length. `None` for a frame that is copied when
+    /// it is taken out, and then holds as much as it is long.
+    pub fn block_len(&self) -> Option<usize> {
+        // SAFETY: the source holds the block for as long as the frame is lent.
+        self.loan.block.map(|block| unsafe { block.as_ref() }.len())
+    }
+
+    /// Takes the frame out of its batch, to live for as long as it is held.
+    ///
+    /// On Linux, Android, the BSDs and illumos, and for TUN interfaces on the Apple systems,
+    /// the reader has read the frame into a block of its own: the frame keeps the block, no
+    /// byte is copied, and the reader reads its next frame into another block, one that an
+    /// earlier frame gave back or a new one. On Windows, and for TAP interfaces on macOS, a
+    /// frame is no longer than the MTU and lies in memory that goes back to the driver or holds
+    /// other frames too: it is copied.
+    pub fn into_owned(self) -> OwnedFrame {
+        let LentFrame { frame, loan } = self;
+        let (checksum, gso) = (frame.checksum(), frame.gso());
+        let bytes = frame.into_data();
+        loan.taken = true;
+        let (link, len) = (loan.link, bytes.len());
+        match loan.block {
+            Some(block) => {
+                // SAFETY: the source holds the block for as long as the frame is lent, and the
+                // batch that lent it is still borrowed: the block is alive and shared from here.
+                let block = unsafe {
+                    Arc::increment_strong_count(block.as_ptr());
+                    Arc::from_raw(block.as_ptr())
+                };
+                OwnedFrame { data: NonNull::from(bytes).cast(), len, link, checksum, gso, block: Some(block) }
+            }
+            None => {
+                let copy = Box::into_raw(Box::<[u8]>::from(&*bytes));
+                let data = NonNull::new(copy).expect("a box is never null").cast();
+                OwnedFrame { data, len, link, checksum, gso, block: None }
+            }
+        }
+    }
+}
+
+impl<'a> std::ops::Deref for LentFrame<'a> {
+    type Target = Frame<'a>;
+
+    fn deref(&self) -> &Frame<'a> {
+        &self.frame
+    }
+}
+
+impl std::ops::DerefMut for LentFrame<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.frame
+    }
+}
+
+impl OwnedFrame {
+    /// The bytes: the IP packet, or the Ethernet frame on a layer 2 device.
+    pub fn data(&self) -> &[u8] {
+        // SAFETY: `len` bytes at `data` belong to the frame, which is borrowed.
+        unsafe { std::slice::from_raw_parts(self.data.as_ptr(), self.len) }
+    }
+
+    /// The bytes, for rewriting headers in place. Keep the lengths as they are.
+    pub fn data_mut(&mut self) -> &mut [u8] {
+        // SAFETY: `len` bytes at `data` belong to the frame alone, which is borrowed alone.
+        unsafe { std::slice::from_raw_parts_mut(self.data.as_ptr(), self.len) }
+    }
+
+    /// How far the transport checksum is done.
+    pub fn checksum(&self) -> Checksum {
+        self.checksum
+    }
+
+    /// Set when the frame is a segment that stands for several packets.
+    pub fn gso(&self) -> Option<Gso> {
+        self.gso
+    }
+
+    /// The frame as a packet to write, as [`Frame::packet`].
+    pub fn packet(&self) -> Packet<'_> {
+        Packet { data: self.data(), checksum: self.checksum, gso: self.gso }
+    }
+
+    /// Completes a partial checksum, as [`Frame::complete_checksum`].
+    pub fn complete_checksum(&mut self) {
+        let mut frame = self.frame();
+        frame.complete_checksum();
+        self.checksum = frame.checksum();
+    }
+
+    /// The packets the frame stands for, cut where they lie, as [`Frame::segments`].
+    pub fn segments(&mut self) -> Segments<'_> {
+        self.frame().into_segments()
+    }
+
+    /// The frame over its own bytes.
+    fn frame(&mut self) -> Frame<'_> {
+        let (link, checksum, gso) = (self.link, self.checksum, self.gso);
+        Frame::trusted(self.data_mut(), link, checksum, gso)
+    }
+}
+
+impl AsRef<[u8]> for OwnedFrame {
+    fn as_ref(&self) -> &[u8] {
+        self.data()
+    }
+}
+
+impl Drop for OwnedFrame {
+    fn drop(&mut self) {
+        if self.block.is_none() {
+            // SAFETY: without a block the bytes are a box of their own, which nothing else
+            // refers to.
+            drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(self.data.as_ptr(), self.len)) });
+        }
+    }
+}
+
+/// The frame's bytes as `Bytes`, to share and slice them without copying. A frame that keeps a
+/// block of its reader's keeps it until the last of the `Bytes` is dropped.
+#[cfg(feature = "bytes")]
+impl From<OwnedFrame> for bytes::Bytes {
+    fn from(frame: OwnedFrame) -> bytes::Bytes {
+        if frame.block.is_some() {
+            return bytes::Bytes::from_owner(frame);
+        }
+        let frame = std::mem::ManuallyDrop::new(frame);
+        // SAFETY: without a block the bytes are a box of their own, which moves out of a frame
+        // that is not dropped.
+        let bytes = unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(frame.data.as_ptr(), frame.len)) };
+        bytes::Bytes::from(bytes)
     }
 }
 
@@ -864,6 +1041,22 @@ impl fmt::Debug for Batch<'_> {
     }
 }
 
+impl fmt::Debug for LentFrame<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.frame.fmt(f)
+    }
+}
+
+impl fmt::Debug for OwnedFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OwnedFrame")
+            .field("data", &self.data())
+            .field("checksum", &self.checksum)
+            .field("gso", &self.gso)
+            .finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use xtun_wire::gather;
@@ -887,6 +1080,12 @@ mod tests {
         assert_eq!((backlog.count(), &bytes[..]), (1, &b"dc"[..]));
         backlog.done(1);
         assert!(backlog.is_empty());
+    }
+
+    #[test]
+    fn an_owned_frame_goes_to_any_thread() {
+        fn anywhere<T: Send + Sync + 'static>() {}
+        anywhere::<OwnedFrame>();
     }
 
     #[test]

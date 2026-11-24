@@ -11,7 +11,7 @@ use xtun_wire::Writes as List;
 
 use super::sys::{msghdr_x, recvmsg_x, sendmsg_x};
 use crate::io::{Filled, ReaderStats, WriterStats};
-use crate::sys::unix::transport::{IoVecs, Read, SLOT, Write, Wrote, retry, wrote};
+use crate::sys::unix::transport::{Found, IoVecs, Read, Slots, Write, Wrote, retry, wrote};
 
 /// Packets sent with one `sendmsg_x` at most.
 const SEND_BATCH: usize = 256;
@@ -53,41 +53,42 @@ impl Headers {
     }
 }
 
-/// The slots of a reader's buffer as a scatter list, filled for one call.
+/// The slots of a reader as a scatter list, filled for one call.
 #[derive(Default)]
-struct Slots(Vec<libc::iovec>);
+struct Rooms(Vec<libc::iovec>);
 
-// SAFETY: the pointers refer to the buffer lent to the call that fills the list; only that
+// SAFETY: the pointers refer to the slots lent to the call that fills the list; only that
 // call dereferences them, and they are cleared before it returns.
-unsafe impl Send for Slots {}
+unsafe impl Send for Rooms {}
 // SAFETY: as above; shared access never dereferences the pointers.
-unsafe impl Sync for Slots {}
+unsafe impl Sync for Rooms {}
 
 /// Reads a utun socket: a packet per message, into a slot each, and every packet that is ready
 /// per `recvmsg_x`.
 #[derive(Default)]
 pub struct MessageReads {
-    slots: Slots,
+    rooms: Rooms,
     headers: Headers,
 }
 
 impl Read for MessageReads {
-    fn read(&mut self, fd: RawFd, buffer: &mut [u8], frames: usize, stats: &mut ReaderStats, mut frame: impl FnMut(&mut [u8])) -> Filled {
-        let MessageReads { slots: Slots(slots), headers } = self;
-        slots.clear();
+    fn read(&mut self, fd: RawFd, slots: &mut Slots, frames: usize, stats: &mut ReaderStats, mut frame: impl FnMut(Found<'_>)) -> Filled {
+        let MessageReads { rooms: Rooms(rooms), headers } = self;
+        rooms.clear();
         headers.0.clear();
-        for slot in buffer.as_chunks_mut::<SLOT>().0.iter_mut().take(frames) {
-            slots.push(libc::iovec { iov_base: slot.as_mut_ptr().cast(), iov_len: SLOT });
+        for slot in 0..frames {
+            let room = slots.room(slot);
+            rooms.push(libc::iovec { iov_base: room.as_mut_ptr().cast(), iov_len: room.len() });
             headers.push(1);
         }
-        headers.link(slots.as_mut_ptr(), slots.len());
+        headers.link(rooms.as_mut_ptr(), rooms.len());
         stats.calls += 1;
-        // SAFETY: every message points at its own slot of `buffer`, which is writable.
+        // SAFETY: every message points at a slot of its own, which is writable.
         let result = retry(|| unsafe { recvmsg_x(fd, headers.0.as_ptr(), headers.0.len() as libc::c_uint, libc::MSG_DONTWAIT) });
         let filled = match result {
             Ok(received) => {
                 for (slot, header) in headers.0[..received].iter().enumerate() {
-                    frame(&mut buffer[slot * SLOT..slot * SLOT + header.msg_datalen]);
+                    frame(slots.filled(slot, header.msg_datalen));
                 }
                 // Fewer packets than slots: the socket is empty.
                 if received < frames { Filled::dry() } else { Filled::more() }
@@ -95,7 +96,7 @@ impl Read for MessageReads {
             Err(error) if error.kind() == ErrorKind::WouldBlock => Filled::dry(),
             Err(error) => Filled::failed(error),
         };
-        slots.clear();
+        rooms.clear();
         headers.0.clear();
         filled
     }
@@ -163,8 +164,9 @@ fn send(fd: RawFd, headers: &[msghdr_x], stats: &mut WriterStats) -> Result<usiz
 /// a `bpf_hdr`, at aligned offsets.
 #[cfg(target_os = "macos")]
 pub struct BpfReads {
-    /// The size of the device's buffer, which a read has to offer.
-    buffer: usize,
+    /// As large as the device's buffer, which a read has to offer. The frames of a read lie
+    /// here side by side.
+    buffer: Box<[u8]>,
     /// The records of the last read that no batch had room for.
     held: Range<usize>,
 }
@@ -177,18 +179,19 @@ impl BpfReads {
         if unsafe { libc::ioctl(fd, super::sys::BIOCGBLEN, &mut size) } < 0 {
             return Err(std::io::Error::last_os_error());
         }
-        Ok(BpfReads { buffer: size as usize, held: 0..0 })
+        Ok(BpfReads { buffer: vec![0u8; size as usize].into_boxed_slice(), held: 0..0 })
     }
 }
 
 #[cfg(target_os = "macos")]
 impl Read for BpfReads {
-    fn buffer_len(&self, _frames: usize) -> usize {
-        self.buffer
+    fn slots(&self, _frames: usize) -> usize {
+        0
     }
 
-    fn read(&mut self, fd: RawFd, buffer: &mut [u8], frames: usize, stats: &mut ReaderStats, mut frame: impl FnMut(&mut [u8])) -> Filled {
+    fn read(&mut self, fd: RawFd, _slots: &mut Slots, frames: usize, stats: &mut ReaderStats, mut frame: impl FnMut(Found<'_>)) -> Filled {
         use super::sys::{BPF_ALIGNMENT, bpf_hdr};
+        let buffer = &mut self.buffer[..];
         if self.held.is_empty() {
             stats.calls += 1;
             // SAFETY: `buffer` is writable for its whole length.
@@ -213,7 +216,7 @@ impl Read for BpfReads {
             }
             self.held.start = next.min(self.held.end);
             if len > 0 && header.bh_caplen == header.bh_datalen {
-                frame(&mut buffer[start..start + len]);
+                frame(Found { bytes: &mut buffer[start..start + len], block: None });
                 handed += 1;
             } else {
                 stats.malformed += 1;
@@ -286,9 +289,12 @@ mod tests {
         }
     }
 
-    fn read(reads: &mut MessageReads, fd: &OwnedFd, buffer: &mut [u8], frames: usize, stats: &mut ReaderStats) -> (Vec<Vec<u8>>, Filled) {
+    fn read(reads: &mut MessageReads, fd: &OwnedFd, slots: &mut Slots, frames: usize, stats: &mut ReaderStats) -> (Vec<Vec<u8>>, Filled) {
         let mut found = Vec::new();
-        let filled = reads.read(fd.as_raw_fd(), buffer, frames, stats, |raw| found.push(raw.to_vec()));
+        let filled = reads.read(fd.as_raw_fd(), slots, frames, stats, |raw| {
+            assert!(raw.block.is_some(), "a packet lies in a block of its own");
+            found.push(raw.bytes.to_vec());
+        });
         (found, filled)
     }
 
@@ -303,17 +309,17 @@ mod tests {
         assert!(writer.calls <= 5, "one call takes many messages");
 
         let mut reads = MessageReads::default();
-        let mut buffer = vec![0u8; 8 * SLOT];
+        let mut slots = Slots::new(8);
         let mut reader = ReaderStats::default();
         // A batch of two slots is filled and says that the socket may hold more.
-        let (found, filled) = read(&mut reads, &far, &mut buffer, 2, &mut reader);
+        let (found, filled) = read(&mut reads, &far, &mut slots, 2, &mut reader);
         assert_eq!(found, [list.0[0].concat(), list.0[1].concat()], "the address family stays in front of its packet");
         assert!(!filled.dry && filled.error.is_none());
         // A batch with slots left over says that the socket is empty.
-        let (found, filled) = read(&mut reads, &far, &mut buffer, 8, &mut reader);
+        let (found, filled) = read(&mut reads, &far, &mut slots, 8, &mut reader);
         assert_eq!(found, [list.0[2].concat(), list.0[3].concat(), list.0[4].concat()]);
         assert!(filled.dry && filled.error.is_none());
-        let (found, filled) = read(&mut reads, &far, &mut buffer, 8, &mut reader);
+        let (found, filled) = read(&mut reads, &far, &mut slots, 8, &mut reader);
         assert!(found.is_empty() && filled.dry && filled.error.is_none());
         assert_eq!(reader.calls, 3);
     }
@@ -323,8 +329,7 @@ mod tests {
         let list = Pieces(vec![vec![vec![0x45; 20]]]);
         let error = MessageWrites::default().write(-1, &list, &mut WriterStats::default()).unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EBADF));
-        let mut buffer = vec![0u8; SLOT];
-        let filled = MessageReads::default().read(-1, &mut buffer, 1, &mut ReaderStats::default(), |_| panic!("nothing was read"));
+        let filled = MessageReads::default().read(-1, &mut Slots::new(1), 1, &mut ReaderStats::default(), |_| panic!("nothing was read"));
         assert_eq!(filled.error.and_then(|error| error.raw_os_error()), Some(libc::EBADF));
     }
 
@@ -347,21 +352,25 @@ mod tests {
         let frames: Vec<Vec<u8>> = (0..3u8).map(|number| vec![number; 60 + 2 * usize::from(number)]).collect();
         // The second record was cut short by the device, and the last one ends with the read,
         // without its padding.
-        let mut buffer = [record(&frames[0], 60), record(&frames[1][..20], 62), record(&frames[2], 64)].concat();
+        let mut buffer: Vec<u8> = [record(&frames[0], 60), record(&frames[1][..20], 62), record(&frames[2], 64)].concat();
         buffer.truncate(buffer.len() - 2);
-        let mut reads = BpfReads { buffer: buffer.len(), held: 0..buffer.len() };
-        let mut stats = ReaderStats::default();
+        let held = 0..buffer.len();
+        let mut reads = BpfReads { buffer: buffer.into_boxed_slice(), held };
+        let (mut slots, mut stats) = (Slots::new(0), ReaderStats::default());
         // No descriptor is read while records of the last read are held.
         let mut found = Vec::new();
-        let filled = reads.read(-1, &mut buffer, 1, &mut stats, |raw| found.push(raw.to_vec()));
-        assert_eq!(found, [frames[0].clone()]);
+        let mut keep = |raw: Found<'_>| {
+            assert!(raw.block.is_none(), "the frames of a read lie side by side");
+            found.push(raw.bytes.to_vec());
+        };
+        let filled = reads.read(-1, &mut slots, 1, &mut stats, &mut keep);
         assert!(!filled.dry && filled.error.is_none());
-        let filled = reads.read(-1, &mut buffer, 4, &mut stats, |raw| found.push(raw.to_vec()));
+        let filled = reads.read(-1, &mut slots, 4, &mut stats, &mut keep);
         assert_eq!(found, [frames[0].clone(), frames[2].clone()]);
         assert!(!filled.dry && filled.error.is_none());
         assert_eq!((stats.malformed, stats.calls), (1, 0));
         assert!(reads.held.is_empty());
-        let filled = reads.read(-1, &mut buffer, 4, &mut stats, |_| panic!("nothing was read"));
+        let filled = reads.read(-1, &mut slots, 4, &mut stats, |_| panic!("nothing was read"));
         assert_eq!(filled.error.and_then(|error| error.raw_os_error()), Some(libc::EBADF));
         assert_eq!(stats.calls, 1);
     }
