@@ -8,8 +8,8 @@ use std::io;
 
 use crate::cut::segment_header_len;
 use crate::packet::{
-    CWR, Checksum, Gso, GsoKind, Packet, TCP, TCP_CHECKSUM, Transport, UDP, UDP_CHECKSUM, adjust_partial, invalid, link_len, read_u16,
-    write_u16,
+    CWR, Checksum, Gso, GsoKind, Head, TCP, TCP_CHECKSUM, Transport, UDP, UDP_CHECKSUM, adjust_partial, invalid, link_len_head,
+    read_u16, write_u16,
 };
 use crate::vnet;
 
@@ -110,21 +110,20 @@ pub(crate) fn describe(head: &[u8], data: &mut [u8], link: Option<usize>) -> io:
 /// Whether a `tun_hdr` can carry what `packet` leaves to the system: a checksum at the transport
 /// header's own field and, for a segment, TCP right after the IP header. Other packets are cut
 /// and completed here.
-pub(crate) fn describes(packet: &Packet<'_>, ethernet: bool) -> bool {
-    let Checksum::Partial { start, offset } = packet.checksum else {
-        return packet.gso.is_none();
+pub(crate) fn describes(head: Head<'_>, checksum: Checksum, gso: Option<Gso>, ethernet: bool) -> bool {
+    let Checksum::Partial { start, offset } = checksum else {
+        return gso.is_none();
     };
-    let data = packet.data;
-    let Some(link) = (if ethernet { link_len(data) } else { Some(0) }) else {
+    let Some(link) = (if ethernet { link_len_head(head) } else { Some(0) }) else {
         return false;
     };
     let (start, offset) = (usize::from(start), usize::from(offset));
-    match packet.gso {
-        None => transport_of(data, link)
+    match gso {
+        None => transport_of(head.bytes, link)
             .is_ok_and(|(_, transport, protocol)| start == transport && checksum_offset(protocol) == Some(offset)),
         Some(gso) => {
             matches!(gso.kind, GsoKind::Tcp4 { .. } | GsoKind::Tcp6 { .. })
-                && Transport::read(data, link).is_some_and(|info| info.tcp && start == info.transport && offset == TCP_CHECKSUM)
+                && Transport::read_head(head, link).is_some_and(|info| info.tcp && start == info.transport && offset == TCP_CHECKSUM)
         }
     }
 }
@@ -217,15 +216,18 @@ mod tests {
         let tcp = Flow::tcp(false).packet(1, &payload(3, 3000));
         let partial = Checksum::Partial { start: 20, offset: TCP_CHECKSUM as u16 };
         let segment = Gso { kind: GsoKind::Tcp4 { ecn: false }, segment_size: 1400, header_len: 0 };
-        assert!(describes(&Packet::new(&tcp), false));
-        assert!(describes(&Packet::new(&tcp).with_checksum(partial), false));
-        assert!(describes(&Packet::new(&tcp).with_checksum(partial).with_gso(segment), false));
-        assert!(!describes(&Packet::new(&tcp).with_checksum(Checksum::Partial { start: 20, offset: 4 }), false));
+        let carries = |data: &[u8], checksum, gso| describes(Head::whole(data), checksum, gso, false);
+        assert!(carries(&tcp, Checksum::Unverified, None));
+        assert!(carries(&tcp, partial, None));
+        assert!(carries(&tcp, partial, Some(segment)));
+        assert!(!carries(&tcp, Checksum::Partial { start: 20, offset: 4 }, None));
+        let short = Head { bytes: &tcp[..40], len: tcp.len() };
+        assert!(!describes(short, partial, Some(segment), false), "a segment whose headers go on past its head");
         let udp = Flow::udp(false).packet(1, &payload(4, 3000));
         let udp_partial = Checksum::Partial { start: 20, offset: UDP_CHECKSUM as u16 };
         let udp_segment = Gso { kind: GsoKind::Udp, segment_size: 1400, header_len: 0 };
-        assert!(describes(&Packet::new(&udp).with_checksum(udp_partial), false));
-        assert!(!describes(&Packet::new(&udp).with_checksum(udp_partial).with_gso(udp_segment), false));
+        assert!(carries(&udp, udp_partial, None));
+        assert!(!carries(&udp, udp_partial, Some(udp_segment)));
     }
 
     #[test]

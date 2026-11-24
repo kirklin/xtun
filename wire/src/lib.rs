@@ -2,9 +2,10 @@
 //!
 //! A [`Framing`] says what a device puts in front of every frame and reads a frame that came
 //! from it. A [`Frame`] is cut into the packets it stands for where it lies. A [`Plan`] turns a
-//! batch of packets into the writes a device takes: runs of a flow joined into segments, what
-//! the device can be told left to it, and the rest carried out before it is written. Nothing
-//! here calls the system, so all of it runs, and is tested, on any machine.
+//! batch of packets, each a [`Packet`] in one stretch or [`Pieces`] that lie apart, into the
+//! writes a device takes: runs of a flow joined into segments, what the device can be told left
+//! to it, and the rest carried out before it is written. Nothing here calls the system, so all
+//! of it runs, and is tested, on any machine.
 
 pub mod checksum;
 mod cut;
@@ -16,5 +17,5 @@ mod vnet;
 
 pub use cut::{Frame, Rest, Segments, take_first};
 pub use framing::{Decoded, Family, Framing, MAX_PREFIX, Prefix, VIRTIO_HEADER};
-pub use packet::{Checksum, Gso, GsoKind, Packet};
+pub use packet::{Checksum, Gso, GsoKind, Packet, Parts, Pieces};
 pub use plan::{Plan, Planned, Takes, Writes, gather};

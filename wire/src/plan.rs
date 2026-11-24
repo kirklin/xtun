@@ -10,20 +10,24 @@
 //!
 //! Nothing is copied but headers. A plan lists, for every write, a few bytes of scratch (the
 //! device's prefix and, where headers were made anew, those headers) and the packets whose bytes
-//! follow it.
+//! follow it. A packet may come in pieces, its headers in the first and its payload in the
+//! others: the pieces go to the device as they lie.
 
 use std::io;
 
-use crate::cut::{Cut, complete_into, segment_header_len};
+use crate::cut::{Cut, MAX_HEADER, complete_into, segment_header_len_head};
 use crate::framing::{Framing, Prefix};
-use crate::packet::{ACK, Checksum, Gso, GsoKind, PSH, Packet, Transport, invalid, ipv4_header_checksum, link_len, pseudo, write_u16};
+use crate::packet::{
+    ACK, Checksum, Gso, GsoKind, Head, PSH, Packet, Parts, Transport, each_in, first_byte, invalid, ipv4_header_checksum, link_len_head,
+    pseudo, write_u16,
+};
 use crate::tunhdr;
 use crate::vnet::{self, Header};
 
 /// No member after this one, and no end before the packet's own.
 const END: u32 = u32::MAX;
-/// One `writev` takes at most `UIO_MAXIOV` pieces: the scratch and one per member.
-const MAX_MEMBERS: usize = 1023;
+/// One `writev` takes at most `UIO_MAXIOV` pieces: the scratch and those of the members.
+const MAX_PIECES: usize = 1024;
 /// The kernel turns a TCP segment size below this into this.
 const MIN_TCP_SEGMENT: usize = 8;
 
@@ -43,17 +47,17 @@ pub struct Takes {
 }
 
 impl Takes {
-    /// Whether the device can be told what `packet` leaves to it: a segment to cut or a
+    /// Whether the device can be told what a packet leaves to it: a segment to cut or a
     /// checksum to complete.
-    fn carries(&self, packet: &Packet<'_>) -> bool {
+    fn carries(&self, head: Head<'_>, checksum: Checksum, gso: Option<Gso>) -> bool {
         match self.framing.prefix {
             Prefix::None | Prefix::Family(_) => false,
-            Prefix::Virtio(_) => match packet.gso.map(|gso| gso.kind) {
+            Prefix::Virtio(_) => match gso.map(|gso| gso.kind) {
                 None => true,
                 Some(GsoKind::Tcp4 { .. } | GsoKind::Tcp6 { .. }) => self.tcp,
                 Some(GsoKind::Udp) => self.udp,
             },
-            Prefix::TunHdr { .. } => tunhdr::describes(packet, self.framing.ethernet),
+            Prefix::TunHdr { .. } => tunhdr::describes(head, checksum, gso, self.framing.ethernet),
         }
     }
 }
@@ -82,6 +86,8 @@ struct Write {
     first: u32,
     last: u32,
     count: u32,
+    /// How many pieces the members come in, at most.
+    pieces: u32,
     skip: u32,
     /// Where the bytes of the only member end, or [`END`] for all of every member.
     end: u32,
@@ -119,9 +125,17 @@ impl Plan {
 
     /// Plans the writes of `packets` for a device that takes what `takes` says. Packets of one
     /// flow stay in their order. Fails, without planning anything, when a packet is marked as a
-    /// segment that cannot be cut as marked, has its checksum field outside itself, or makes a
-    /// frame longer than the device takes.
+    /// segment that cannot be cut as marked, has its checksum field outside itself, makes a
+    /// frame longer than the device takes, or comes in more than 1023 pieces.
     pub fn plan(&mut self, takes: &Takes, packets: &[Packet<'_>]) -> io::Result<()> {
+        self.plan_parts(takes, packets)
+    }
+
+    /// [`Plan::plan`] for packets of either kind: [`Packet`]s, or [`Pieces`] with pieces of any
+    /// type.
+    ///
+    /// [`Pieces`]: crate::Pieces
+    pub fn plan_parts<P: Parts>(&mut self, takes: &Takes, packets: &[P]) -> io::Result<()> {
         self.writes.clear();
         self.scratch.clear();
         self.next.clear();
@@ -141,21 +155,57 @@ impl Plan {
     }
 
     /// The planned writes of `packets`, the batch that was planned.
-    pub fn writes<'a>(&'a self, packets: &'a [Packet<'a>]) -> Planned<'a> {
+    pub fn writes<'a, P: Parts>(&'a self, packets: &'a [P]) -> Planned<'a, P> {
         Planned { plan: self, packets }
     }
 
-    fn add(&mut self, takes: &Takes, joins: bool, index: u32, packet: &Packet<'_>, packets: &[Packet<'_>]) -> io::Result<()> {
-        let data = packet.data;
-        let link = if takes.framing.ethernet { link_len(data) } else { Some(0) };
-        let gso = match packet.gso {
-            Some(gso) => {
-                let link = link.ok_or_else(|| invalid("a segment has to carry IPv4 or IPv6"))?;
-                Some(Gso { header_len: segment_header_len(data, link, packet.checksum, gso)?, ..gso })
-            }
-            None => {
-                if let Checksum::Partial { start, offset } = packet.checksum
-                    && usize::from(start) + usize::from(offset) + 2 > data.len()
+    fn add<P: Parts>(&mut self, takes: &Takes, joins: bool, index: u32, packet: &P, packets: &[P]) -> io::Result<()> {
+        let whole = Head::of(packet);
+        // Where the head does not say everything about a packet, its headers may go on past
+        // the head: they are read again from a copy of the packet's first bytes.
+        if packet.pieces() == 0 || whole.bytes.len() >= whole.len.min(MAX_HEADER) {
+            return self.add_read(takes, joins, index, packet, packets, whole, false).map(drop);
+        }
+        if self.add_read(takes, joins, index, packet, packets, whole, true)? {
+            return Ok(());
+        }
+        let (bytes, len) = first_bytes(packet);
+        self.add_read(takes, joins, index, packet, packets, Head { bytes: &bytes[..len], len: whole.len }, false).map(drop)
+    }
+
+    /// Plans `packet` by what `head`, its first bytes, says about it. With `again`, a packet
+    /// about which `head` does not say everything is left alone, and the answer is `false`.
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn add_read<P: Parts>(
+        &mut self,
+        takes: &Takes,
+        joins: bool,
+        index: u32,
+        packet: &P,
+        packets: &[P],
+        head: Head<'_>,
+        again: bool,
+    ) -> io::Result<bool> {
+        let (data, checksum) = (head.bytes, packet.checksum());
+        // The head and the pieces behind it, next to the scratch of a write.
+        let pieces = 1 + packet.pieces();
+        if 1 + pieces > MAX_PIECES {
+            return Err(too_many());
+        }
+        let pieces = pieces as u32;
+        let link = if takes.framing.ethernet { link_len_head(head) } else { Some(0) };
+        let gso = match (packet.gso(), link) {
+            (Some(gso), Some(link)) => match segment_header_len_head(head, link, checksum, gso) {
+                Ok(header_len) => Some(Gso { header_len, ..gso }),
+                Err(_) if again => return Ok(false),
+                Err(error) => return Err(error),
+            },
+            (Some(_), None) if again => return Ok(false),
+            (Some(_), None) => return Err(invalid("a segment has to carry IPv4 or IPv6")),
+            (None, _) => {
+                if let Checksum::Partial { start, offset } = checksum
+                    && usize::from(start) + usize::from(offset) + 2 > head.len
                 {
                     return Err(invalid("the checksum field lies outside the packet"));
                 }
@@ -163,45 +213,54 @@ impl Plan {
             }
         };
         // The flow, so that its packets stay in order whatever becomes of each.
-        let info = if joins { link.and_then(|link| Transport::read(data, link)) } else { None };
+        let info = if joins { link.and_then(|link| Transport::read_head(head, link)) } else { None };
+        let claims = gso.is_some() || matches!(checksum, Checksum::Partial { .. });
+        let carried = !claims || takes.carries(head, checksum, gso);
+        if again && (link.is_none() || (joins && info.is_none()) || !carried) {
+            return Ok(false);
+        }
         let key = info.as_ref().map(|info| Key::new(data, info));
-        let claims = gso.is_some() || matches!(packet.checksum, Checksum::Partial { .. });
-        if claims && !takes.carries(packet) {
+        if !carried {
             let first = self.writes.len() as u32;
-            self.carry_out(takes, index, packet, link.unwrap_or(0), gso)?;
+            self.carry_out(takes, index, packet, head, link.unwrap_or(0), gso)?;
             if let Some(key) = key {
                 self.table.set(key, first);
             }
-            return Ok(());
+            return Ok(true);
         }
         if let Some(gso) = gso {
-            self.push_raw(index, Header::for_packet(packet.checksum, Some(gso)), key);
-            return Ok(());
+            self.push_raw(index, pieces, Header::for_packet(checksum, Some(gso)), key);
+            return Ok(true);
         }
-        if data.len() > takes.max_frame {
+        if head.len > takes.max_frame {
             return Err(too_long(takes.max_frame));
         }
         let (Some(info), Some(key)) = (info, key) else {
-            self.push_raw(index, Header::for_packet(packet.checksum, None), None);
-            return Ok(());
+            self.push_raw(index, pieces, Header::for_packet(checksum, None), None);
+            return Ok(true);
         };
-        let trusted = match packet.checksum {
+        // A run takes its headers from the head of its first packet.
+        if info.header_len > packet.head().len() {
+            self.push_raw(index, pieces, Header::for_packet(checksum, None), Some(key));
+            return Ok(true);
+        }
+        let trusted = match checksum {
             Checksum::Partial { start, offset } => {
                 usize::from(start) == info.transport && usize::from(offset) == info.checksum_offset()
             }
             Checksum::Valid => true,
-            Checksum::Unverified => info.verify(data),
+            Checksum::Unverified => info.verify_parts(packet, head.len),
         };
         if !trusted {
-            self.push_raw(index, Header::for_packet(packet.checksum, None), Some(key));
-            return Ok(());
+            self.push_raw(index, pieces, Header::for_packet(checksum, None), Some(key));
+            return Ok(true);
         }
-        let candidate = Candidate::new(data, &info, takes);
+        let candidate = Candidate::new(head, &info, takes, pieces);
         if let Some(write) = self.table.get(&key)
             && self.can_join(takes, write, &candidate, data, packets)
         {
             self.join(write, index, &candidate);
-            return Ok(());
+            return Ok(true);
         }
         let open = candidate.joinable && !candidate.psh && (!info.tcp || candidate.payload >= MIN_TCP_SEGMENT);
         let run = Run {
@@ -211,17 +270,17 @@ impl Plan {
             next_seq: candidate.seq.wrapping_add(candidate.payload as u32),
             open,
             psh: candidate.psh,
-            partial: matches!(packet.checksum, Checksum::Partial { .. }),
+            partial: matches!(checksum, Checksum::Partial { .. }),
         };
         let write = self.writes.len() as u32;
-        self.writes.push(Write { first: index, last: index, count: 1, skip: 0, end: END, scratch: (0, 0), kind: Kind::Joined(run) });
+        self.writes.push(Write { first: index, last: index, count: 1, pieces, skip: 0, end: END, scratch: (0, 0), kind: Kind::Joined(run) });
         self.table.set(key, write);
-        Ok(())
+        Ok(true)
     }
 
-    fn push_raw(&mut self, index: u32, header: Header, key: Option<Key>) {
+    fn push_raw(&mut self, index: u32, pieces: u32, header: Header, key: Option<Key>) {
         let write = self.writes.len() as u32;
-        self.writes.push(Write { first: index, last: index, count: 1, skip: 0, end: END, scratch: (0, 0), kind: Kind::Raw(header) });
+        self.writes.push(Write { first: index, last: index, count: 1, pieces, skip: 0, end: END, scratch: (0, 0), kind: Kind::Raw(header) });
         if let Some(key) = key {
             self.table.set(key, write);
         }
@@ -230,11 +289,11 @@ impl Plan {
     /// Does here what `packet` leaves to a device that cannot be told: cuts a segment into its
     /// packets and completes checksums. Each packet becomes a write of its own, its headers in
     /// the scratch behind a prefix that leaves nothing to the device.
-    fn carry_out(&mut self, takes: &Takes, index: u32, packet: &Packet<'_>, link: usize, gso: Option<Gso>) -> io::Result<()> {
-        let data = packet.data;
+    fn carry_out<P: Parts>(&mut self, takes: &Takes, index: u32, packet: &P, head: Head<'_>, link: usize, gso: Option<Gso>) -> io::Result<()> {
         let prefix = takes.framing.prefix;
         // Only a tun device takes the address family, and its packets start with the IP version.
-        let v6 = data.first().is_some_and(|byte| byte >> 4 == 6);
+        let v6 = first_byte(packet).is_some_and(|byte| byte >> 4 == 6);
+        let pieces = 1 + packet.pieces() as u32;
         let Plan { writes, scratch, .. } = self;
         let lead = |scratch: &mut Vec<u8>| {
             let at = scratch.len();
@@ -247,29 +306,30 @@ impl Plan {
                 return Err(too_long(takes.max_frame));
             }
             let scratch = (at as u32, scratch.len() as u32);
-            writes.push(Write { first: index, last: index, count: 1, skip: body.start as u32, end: body.end as u32, scratch, kind: Kind::Piece });
+            let (skip, end) = (body.start as u32, body.end as u32);
+            writes.push(Write { first: index, last: index, count: 1, pieces, skip, end, scratch, kind: Kind::Piece });
             Ok(())
         };
-        match (gso, packet.checksum) {
+        match (gso, packet.checksum()) {
             (Some(gso), checksum) => {
-                let cut = Cut::new(data, link, checksum, gso);
-                for packet in 0..cut.count {
+                let cut = Cut::of(head, link, checksum, gso);
+                for cut_packet in 0..cut.count {
                     let at = lead(scratch);
-                    let body = cut.copy_header(packet, data, scratch);
+                    let body = cut.copy_header(cut_packet, packet, scratch);
                     piece(scratch, at, body)?;
                 }
                 Ok(())
             }
             (None, Checksum::Partial { start, offset }) => {
                 let at = lead(scratch);
-                let body = complete_into(data, usize::from(start), usize::from(offset), scratch);
+                let body = complete_into(packet, head.len, usize::from(start), usize::from(offset), scratch);
                 piece(scratch, at, body)
             }
             (None, _) => unreachable!("only a packet that leaves something to the device is carried out"),
         }
     }
 
-    fn can_join(&self, takes: &Takes, write: u32, candidate: &Candidate, data: &[u8], packets: &[Packet<'_>]) -> bool {
+    fn can_join<P: Parts>(&self, takes: &Takes, write: u32, candidate: &Candidate, data: &[u8], packets: &[P]) -> bool {
         let write = &self.writes[write as usize];
         let Kind::Joined(run) = &write.kind else {
             return false;
@@ -280,11 +340,11 @@ impl Plan {
         }
         let total = info.header_len + run.payload + candidate.payload;
         let limit = info.link + if info.v6 { 65_535 + 40 } else { 65_535 };
-        let members = if info.tcp { MAX_MEMBERS } else { takes.udp_max_segments.min(MAX_MEMBERS) };
-        if total > limit || write.count as usize >= members {
+        let members = if info.tcp { usize::MAX } else { takes.udp_max_segments };
+        if total > limit || write.count as usize >= members || 1 + (write.pieces + candidate.pieces) as usize > MAX_PIECES {
             return false;
         }
-        let first = packets[write.first as usize].data;
+        let first = packets[write.first as usize].head();
         let ip = info.link;
         let same_ip = if info.v6 {
             first[ip..ip + 4] == data[ip..ip + 4] && first[ip + 7] == data[ip + 7]
@@ -315,6 +375,7 @@ impl Plan {
         let write = &mut self.writes[write as usize];
         write.last = index;
         write.count += 1;
+        write.pieces += candidate.pieces;
         if let Kind::Joined(run) = &mut write.kind {
             run.payload += candidate.payload;
             run.next_seq = run.next_seq.wrapping_add(candidate.payload as u32);
@@ -328,12 +389,13 @@ impl Plan {
 
     /// Writes the scratch of every write that has none yet: the prefix and, for a run, its new
     /// headers.
-    fn finish(&mut self, takes: &Takes, packets: &[Packet<'_>]) {
+    fn finish<P: Parts>(&mut self, takes: &Takes, packets: &[P]) {
         let prefix = takes.framing.prefix;
         let prefix_len = prefix.len();
         let Plan { writes, scratch, .. } = self;
         for write in writes.iter_mut() {
-            let first = packets[write.first as usize].data;
+            let packet = &packets[write.first as usize];
+            let first = packet.head();
             let at = scratch.len();
             let (header, v6) = match write.kind {
                 Kind::Piece => continue,
@@ -344,7 +406,7 @@ impl Plan {
                 }
                 // Only a tun device takes the address family, and its packets start with the IP
                 // version.
-                Kind::Raw(header) => (header, first.first().is_some_and(|byte| byte >> 4 == 6)),
+                Kind::Raw(header) => (header, first_byte(packet).is_some_and(|byte| byte >> 4 == 6)),
                 Kind::Joined(run) => {
                     let info = &run.info;
                     scratch.resize(at + prefix_len + info.header_len, 0);
@@ -380,38 +442,60 @@ impl Plan {
     }
 }
 
+/// The first bytes of `packet`, up to [`MAX_HEADER`] of them, in one stretch, and how many
+/// they are.
+#[cold]
+fn first_bytes(packet: &impl Parts) -> ([u8; MAX_HEADER], usize) {
+    let (mut bytes, mut at) = ([0u8; MAX_HEADER], 0);
+    each_in(packet, 0..MAX_HEADER, |stretch| {
+        bytes[at..at + stretch.len()].copy_from_slice(stretch);
+        at += stretch.len();
+    });
+    (bytes, at)
+}
+
+#[cold]
+fn too_many() -> io::Error {
+    invalid(&format!("a packet comes in more than the {} pieces a write takes", MAX_PIECES - 1))
+}
+
 fn too_long(max: usize) -> io::Error {
     invalid(&format!("a packet is longer than the {max} bytes the device takes"))
 }
 
 /// The writes of a planned batch.
-#[derive(Clone, Copy)]
-pub struct Planned<'a> {
+pub struct Planned<'a, P> {
     plan: &'a Plan,
-    packets: &'a [Packet<'a>],
+    packets: &'a [P],
 }
 
-impl Writes for Planned<'_> {
+impl<P> Clone for Planned<'_, P> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<P> Copy for Planned<'_, P> {}
+
+impl<P: Parts> Writes for Planned<'_, P> {
     fn count(&self) -> usize {
         self.plan.writes.len()
     }
 
     fn pieces<'a>(&'a self, index: usize, mut each: impl FnMut(&'a [u8])) {
         let write = &self.plan.writes[index];
-        let mut piece = |bytes: &'a [u8]| {
-            if !bytes.is_empty() {
-                each(bytes);
-            }
-        };
-        piece(&self.plan.scratch[write.scratch.0 as usize..write.scratch.1 as usize]);
+        let scratch = &self.plan.scratch[write.scratch.0 as usize..write.scratch.1 as usize];
+        if !scratch.is_empty() {
+            each(scratch);
+        }
         let skip = write.skip as usize;
         if write.end != END {
-            piece(&self.packets[write.first as usize].data[skip..write.end as usize]);
+            each_in(&self.packets[write.first as usize], skip..write.end as usize, each);
             return;
         }
         let mut member = write.first;
         while member != END {
-            piece(&self.packets[member as usize].data[skip..]);
+            each_in(&self.packets[member as usize], skip..usize::MAX, &mut each);
             member = self.plan.next[member as usize];
         }
     }
@@ -424,11 +508,14 @@ struct Candidate {
     payload: usize,
     seq: u32,
     psh: bool,
+    /// How many pieces the packet comes in.
+    pieces: u32,
 }
 
 impl Candidate {
-    fn new(data: &[u8], info: &Transport, takes: &Takes) -> Candidate {
-        let payload = data.len() - info.header_len;
+    fn new(head: Head<'_>, info: &Transport, takes: &Takes, pieces: u32) -> Candidate {
+        let data = head.bytes;
+        let payload = head.len - info.header_len;
         let plain_ip = info.v6 || info.transport - info.link == 20;
         if info.tcp {
             let t = info.transport;
@@ -439,9 +526,10 @@ impl Candidate {
                 payload,
                 seq: u32::from_be_bytes(data[t + 4..t + 8].try_into().expect("four bytes")),
                 psh: flags & PSH != 0,
+                pieces,
             }
         } else {
-            Candidate { joinable: takes.udp && plain_ip && payload > 0, header_len: info.header_len, payload, seq: 0, psh: false }
+            Candidate { joinable: takes.udp && plain_ip && payload > 0, header_len: info.header_len, payload, seq: 0, psh: false, pieces }
         }
     }
 }
@@ -545,7 +633,7 @@ mod tests {
     use crate::cut::Frame;
     use crate::framing::Family;
     use crate::packet::build::{Flow, payload};
-    use crate::packet::{CWR, FIN, TCP};
+    use crate::packet::{CWR, FIN, Packet, Pieces, TCP, link_len};
 
     const BSD: Family = Family { inet: 2, inet6: 24 };
 
@@ -563,13 +651,13 @@ mod tests {
         takes(Prefix::None, false, false, false)
     }
 
-    fn planned(takes: &Takes, packets: &[Packet<'_>]) -> Plan {
+    fn planned<P: Parts>(takes: &Takes, packets: &[P]) -> Plan {
         let mut plan = Plan::new();
-        plan.plan(takes, packets).unwrap();
+        plan.plan_parts(takes, packets).unwrap();
         plan
     }
 
-    fn write(plan: &Plan, packets: &[Packet<'_>], index: usize) -> Vec<u8> {
+    fn write<P: Parts>(plan: &Plan, packets: &[P], index: usize) -> Vec<u8> {
         let mut out = Vec::new();
         gather(&plan.writes(packets), index, &mut out);
         out
@@ -594,7 +682,7 @@ mod tests {
         out
     }
 
-    fn written(plan: &Plan, packets: &[Packet<'_>]) -> Vec<Vec<u8>> {
+    fn written<P: Parts>(plan: &Plan, packets: &[P]) -> Vec<Vec<u8>> {
         (0..plan.writes.len()).flat_map(|index| kernel_reads(&write(plan, packets, index))).collect()
     }
 
@@ -922,6 +1010,164 @@ mod tests {
                     u16::from_be_bytes([p[info.transport], p[info.transport + 1]]) == 1000 + flow as u16
                 }).collect();
                 prop_assert_eq!(got, sent);
+            }
+        }
+    }
+
+    /// A packet in pieces: its first bytes, then stretches of one size.
+    struct Split {
+        head: Vec<u8>,
+        body: Vec<Vec<u8>>,
+        checksum: Checksum,
+        gso: Option<Gso>,
+    }
+
+    impl Split {
+        fn new(packet: &Packet<'_>, head: usize, size: usize) -> Split {
+            let (head, body) = packet.data.split_at(head.min(packet.data.len()));
+            Split { head: head.to_vec(), body: body.chunks(size).map(<[u8]>::to_vec).collect(), checksum: packet.checksum, gso: packet.gso }
+        }
+
+        fn view(&self) -> Pieces<'_, Vec<u8>> {
+            Pieces { head: &self.head, body: &self.body, checksum: self.checksum, gso: self.gso }
+        }
+    }
+
+    fn every_write<P: Parts>(plan: &Plan, packets: &[P]) -> Vec<Vec<u8>> {
+        (0..plan.writes.len()).map(|index| write(plan, packets, index)).collect()
+    }
+
+    /// Where the headers of a TCP or UDP packet end; 20 bytes in for any other.
+    fn headers(packet: &[u8]) -> usize {
+        Transport::read(packet, 0).map_or(20, |info| info.header_len)
+    }
+
+    #[test]
+    fn pieces_behind_their_headers_are_planned_like_the_packets_whole() {
+        let mut packets = Vec::new();
+        for v6 in [false, true] {
+            packets.extend(tcp_run(&mut Flow::tcp(v6), 7, &[1400; 30], 1));
+            let first = Flow::udp(v6).id;
+            packets.extend((0..40u32).map(|i| Flow { id: first.wrapping_add(i as u16), ..Flow::udp(v6) }.packet(0, &payload(i, 900))));
+        }
+        packets.push(vec![0x45, 0, 0, 28, 0, 0, 0x40, 0, 64, 1, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2, 8, 0, 0xf7, 0xff, 0, 0, 0, 0]);
+        let mut other = Flow::tcp(true);
+        other.src_port = 9;
+        let (tcp, tcp_checksum, tcp_gso, _) = segment(&other, 1400, 9000);
+        let mut datagrams = Flow::udp(false);
+        datagrams.src_port = 9;
+        let (udp, udp_checksum, udp_gso, _) = segment(&datagrams, 1200, 5000);
+        let mut views: Vec<Packet<'_>> = packets.iter().map(|p| Packet::new(p)).collect();
+        views.push(Packet::new(&tcp).with_checksum(tcp_checksum).with_gso(tcp_gso));
+        views.push(Packet::new(&tcp).with_checksum(tcp_checksum));
+        views.push(Packet::new(&udp).with_checksum(udp_checksum).with_gso(udp_gso));
+        let splits: Vec<Split> =
+            views.iter().enumerate().map(|(index, view)| Split::new(view, headers(view.data), 16 + index * 37 % 977)).collect();
+        let pieces: Vec<Pieces<'_, Vec<u8>>> = splits.iter().map(Split::view).collect();
+        let devices = [
+            virtio(true, false),
+            virtio(false, false),
+            bare(),
+            takes(Prefix::Family(BSD), false, false, false),
+            takes(Prefix::TunHdr { family: Some(BSD) }, true, false, false),
+        ];
+        for device in devices {
+            let (whole, cut) = (planned(&device, &views), planned(&device, &pieces));
+            assert_eq!(counts(&cut), counts(&whole), "{device:?}");
+            assert_eq!(every_write(&cut, &pieces), every_write(&whole, &views), "{device:?}");
+        }
+    }
+
+    #[test]
+    fn a_write_takes_no_more_pieces_than_the_system_does() {
+        let packet = Flow::udp(false).packet(0, &payload(1, 1100));
+        let view = Packet::new(&packet).with_checksum(Checksum::Valid);
+        let most = Split::new(&view, 106, 1);
+        assert_eq!(most.body.len(), MAX_PIECES - 2);
+        let plan = planned(&virtio(true, false), &[most.view()]);
+        let mut count = 0;
+        plan.writes(&[most.view()]).pieces(0, |_| count += 1);
+        assert_eq!(count, MAX_PIECES, "the device's prefix, the head and the rest a byte at a time");
+        let more = Split::new(&view, 105, 1);
+        assert!(Plan::new().plan_parts(&virtio(true, false), &[more.view()]).is_err());
+
+        let packets = tcp_run(&mut Flow::tcp(false), 0, &[1400; 10], 1);
+        let splits: Vec<Split> =
+            packets.iter().map(|p| Split::new(&Packet::new(p).with_checksum(Checksum::Valid), headers(p), 4)).collect();
+        let pieces: Vec<Pieces<'_, Vec<u8>>> = splits.iter().map(Split::view).collect();
+        let plan = planned(&virtio(true, false), &pieces);
+        assert_eq!(counts(&plan), [2; 5], "a third packet of 351 pieces is one too many for a write");
+        assert_eq!(written(&plan, &pieces), packets);
+    }
+
+    #[test]
+    fn the_address_family_is_read_from_the_first_byte_wherever_it_lies() {
+        let packet = Flow::udp(true).packet(0, &payload(1, 100));
+        let body = [Vec::new(), packet.clone()];
+        let pieces = [Pieces::new(&[], &body)];
+        let plan = planned(&takes(Prefix::Family(BSD), false, false, false), &pieces);
+        assert_eq!(write(&plan, &pieces, 0), [&BSD.inet6.to_be_bytes()[..], &packet].concat());
+        let nothing: [Pieces<'_, Vec<u8>>; 1] = [Pieces::new(&[], &[])];
+        let plan = planned(&bare(), &nothing);
+        assert_eq!(every_write(&plan, &nothing), [Vec::<u8>::new()]);
+    }
+
+    proptest! {
+        #[test]
+        fn any_pieces_of_any_batch_come_back_out_in_flow_order(
+            steps in prop::collection::vec((step(), 0usize..120, 2usize..800), 1..120),
+            udp in any::<bool>(),
+        ) {
+            let mut flows: Vec<Flow> = (0..4).map(|i| {
+                let mut flow = if i < 2 { Flow::tcp(i == 1) } else { Flow::udp(i == 3) };
+                flow.src_port = 1000 + i as u16;
+                flow
+            }).collect();
+            let mut seqs = [0u32; 4];
+            let mut packets = Vec::new();
+            for (index, (step, _, _)) in steps.iter().enumerate() {
+                let flow = &mut flows[step.flow];
+                if flow.tcp {
+                    flow.flags = if step.psh { ACK | PSH } else { ACK };
+                }
+                packets.push((step.flow, flow.packet(seqs[step.flow], &payload(index as u32, step.size))));
+                seqs[step.flow] = seqs[step.flow].wrapping_add(step.size as u32);
+                flow.id = flow.id.wrapping_add(1);
+            }
+            let splits: Vec<Split> = packets.iter().zip(&steps)
+                .map(|((_, p), (_, head, size))| Split::new(&Packet::new(p), *head, *size))
+                .collect();
+            let pieces: Vec<Pieces<'_, Vec<u8>>> = splits.iter().map(Split::view).collect();
+            let plan = planned(&virtio(udp, false), &pieces);
+            let out = written(&plan, &pieces);
+            prop_assert_eq!(out.len(), packets.len());
+            for flow in 0..4 {
+                let sent: Vec<&Vec<u8>> = packets.iter().filter(|(f, _)| *f == flow).map(|(_, p)| p).collect();
+                let got: Vec<&Vec<u8>> = out.iter().filter(|p| {
+                    let info = Transport::read(p, 0).unwrap();
+                    u16::from_be_bytes([p[info.transport], p[info.transport + 1]]) == 1000 + flow as u16
+                }).collect();
+                prop_assert_eq!(got, sent);
+            }
+        }
+
+        #[test]
+        fn a_segment_in_any_pieces_is_cut_and_completed_like_the_segment_whole(
+            tcp in any::<bool>(),
+            v6 in any::<bool>(),
+            size in 1usize..1500,
+            length in 1usize..9000,
+            head in 0usize..120,
+            piece in 10usize..3000,
+        ) {
+            let flow = if tcp { Flow::tcp(v6) } else { Flow::udp(v6) };
+            let (whole, checksum, gso, _) = segment(&flow, size, length);
+            let views = [Packet::new(&whole).with_checksum(checksum).with_gso(gso), Packet::new(&whole).with_checksum(checksum)];
+            let splits = views.map(|view| Split::new(&view, head, piece));
+            let pieces = [splits[0].view(), splits[1].view()];
+            for device in [bare(), takes(Prefix::TunHdr { family: Some(BSD) }, false, false, false), virtio(false, false)] {
+                let (expected, cut) = (planned(&device, &views), planned(&device, &pieces));
+                prop_assert_eq!(every_write(&cut, &pieces), every_write(&expected, &views));
             }
         }
     }

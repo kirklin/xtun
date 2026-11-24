@@ -3,7 +3,7 @@
 
 #![allow(dead_code)]
 
-use xtun_wire::{Checksum, Frame, Framing, Gso, GsoKind, Packet, Plan, Prefix, Takes, VIRTIO_HEADER, Writes, gather};
+use xtun_wire::{Checksum, Frame, Framing, Gso, GsoKind, Parts, Plan, Prefix, Takes, VIRTIO_HEADER, Writes, gather};
 
 /// The framing of a Linux tun device with offloads.
 pub const VIRTIO: Framing = Framing { prefix: Prefix::Virtio(VIRTIO_HEADER), ethernet: false };
@@ -31,9 +31,9 @@ pub fn read(framing: Framing, bytes: &[u8]) -> Option<Vec<Vec<u8>>> {
 
 /// Plans `packets` for a device that takes `takes`, then reads every write back as the device
 /// would. Returns `None` when planning refuses the batch.
-pub fn plan_and_read(takes: &Takes, packets: &[Packet<'_>]) -> Option<Vec<Vec<u8>>> {
+pub fn plan_and_read<P: Parts>(takes: &Takes, packets: &[P]) -> Option<Vec<Vec<u8>>> {
     let mut plan = Plan::new();
-    plan.plan(takes, packets).ok()?;
+    plan.plan_parts(takes, packets).ok()?;
     let writes = plan.writes(packets);
     let mut out = Vec::new();
     let mut write = Vec::new();

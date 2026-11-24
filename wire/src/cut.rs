@@ -10,8 +10,8 @@ use std::ops::Range;
 
 use crate::checksum::Sum;
 use crate::packet::{
-    CWR, Checksum, FIN, Gso, GsoKind, PSH, Packet, TCP_CHECKSUM, UDP_CHECKSUM, adjust_partial, complete, invalid,
-    ipv4_header_checksum, link_len, read_u16, write_u16,
+    CWR, Checksum, FIN, Gso, GsoKind, Head, PSH, Packet, Parts, TCP_CHECKSUM, UDP_CHECKSUM, adjust_partial, complete, each_in,
+    invalid, ipv4_header_checksum, link_len, read_u16, sum_in, write_u16,
 };
 
 /// The longest headers a segment can repeat: IPv6 with extension headers and TCP options.
@@ -21,9 +21,16 @@ pub(crate) const MAX_HEADER: usize = 256;
 /// the length of the headers every packet repeats. The length is taken from the packet: the
 /// kernel's `hdr_len` is only a hint.
 pub(crate) fn segment_header_len(data: &[u8], link: usize, checksum: Checksum, gso: Gso) -> io::Result<u16> {
+    segment_header_len_head(Head::whole(data), link, checksum, gso)
+}
+
+/// [`segment_header_len`] for a segment of which `head` holds the first bytes, the first
+/// [`MAX_HEADER`] at least unless the segment is shorter.
+pub(crate) fn segment_header_len_head(head: Head<'_>, link: usize, checksum: Checksum, gso: Gso) -> io::Result<u16> {
     let Checksum::Partial { start, offset } = checksum else {
         return Err(invalid("a segment to cut needs a partial checksum"));
     };
+    let data = head.bytes;
     let start = usize::from(start);
     let version = data.get(link).map(|byte| byte >> 4);
     let (tcp, v6) = match gso.kind {
@@ -36,7 +43,7 @@ pub(crate) fn segment_header_len(data: &[u8], link: usize, checksum: Checksum, g
     }
     let ip = &data[link..];
     if v6 {
-        if start < link + 40 || ip.len() < 40 || 40 + usize::from(u16::from_be_bytes([ip[4], ip[5]])) != ip.len() {
+        if start < link + 40 || ip.len() < 40 || 40 + usize::from(u16::from_be_bytes([ip[4], ip[5]])) != head.len - link {
             return Err(invalid("the IPv6 segment's lengths do not add up"));
         }
     } else if ip.len() < 20 || start < link + 20 || link + usize::from(ip[0] & 0x0f) * 4 != start {
@@ -58,7 +65,7 @@ pub(crate) fn segment_header_len(data: &[u8], link: usize, checksum: Checksum, g
         8
     };
     let header_len = start + transport;
-    if gso.segment_size == 0 || header_len >= data.len() || header_len > MAX_HEADER {
+    if gso.segment_size == 0 || header_len >= head.len || header_len > MAX_HEADER {
         return Err(invalid("the segment has no payload, a zero segment size or headers that are too long"));
     }
     Ok(header_len as u16)
@@ -88,6 +95,13 @@ pub(crate) struct Cut {
 impl Cut {
     /// `gso.header_len` must have come from [`segment_header_len`] with the same `link`.
     pub fn new(data: &[u8], link: usize, checksum: Checksum, gso: Gso) -> Cut {
+        Cut::of(Head::whole(data), link, checksum, gso)
+    }
+
+    /// [`Cut::new`] for a segment that may come in pieces; `gso.header_len` must have come from
+    /// [`segment_header_len_head`] with the same head and `link`.
+    pub fn of(head: Head<'_>, link: usize, checksum: Checksum, gso: Gso) -> Cut {
+        let data = head.bytes;
         let Checksum::Partial { start, offset } = checksum else {
             unreachable!("a checked segment has a partial checksum")
         };
@@ -102,8 +116,8 @@ impl Cut {
             v6: data[link] >> 4 == 6,
             tcp,
             size,
-            len: data.len(),
-            count: (data.len() - header_len).div_ceil(size),
+            len: head.len,
+            count: (head.len - header_len).div_ceil(size),
             first_seq: if tcp { u32::from_be_bytes(data[transport + 4..transport + 8].try_into().expect("four bytes")) } else { 0 },
             first_id: read_u16(data, link + 4),
             partial: read_u16(data, checksum_at),
@@ -161,30 +175,31 @@ impl Cut {
         Checksum::Partial { start: self.transport as u16, offset: (self.checksum_at - self.transport) as u16 }
     }
 
-    /// Appends the headers of packet `index` to `out`, with a complete checksum, and returns the
-    /// range of its payload in `data`.
-    pub fn copy_header(&self, index: usize, data: &[u8], out: &mut Vec<u8>) -> Range<usize> {
+    /// Appends the headers of packet `index` of the segment `whole` to `out`, with a complete
+    /// checksum, and returns the range of its payload in the segment.
+    pub fn copy_header(&self, index: usize, whole: &impl Parts, out: &mut Vec<u8>) -> Range<usize> {
         let payload = self.payload(index);
         let at = out.len();
-        out.extend_from_slice(&data[..self.header_len]);
+        each_in(whole, 0..self.header_len, |bytes| out.extend_from_slice(bytes));
         let header = &mut out[at..];
         self.patch(header, index, payload.len());
-        let value = Sum::ZERO.bytes(&header[self.transport..]).bytes(&data[payload.clone()]).checksum();
+        let value = sum_in(whole, payload.clone(), Sum::ZERO.bytes(&header[self.transport..])).checksum();
         write_u16(header, self.checksum_at, value);
         payload
     }
 }
 
-/// Copies the headers of a packet with a partial checksum into `out` up to the checksum field,
-/// completes the checksum there, and returns the range of the rest of the packet in `data`.
-pub(crate) fn complete_into(data: &[u8], start: usize, offset: usize, out: &mut Vec<u8>) -> Range<usize> {
+/// Copies the bytes of `packet`, which has a partial checksum and `total` bytes, into `out` up
+/// to the checksum field, completes the checksum there, and returns the range of the rest of the
+/// packet.
+pub(crate) fn complete_into(packet: &impl Parts, total: usize, start: usize, offset: usize, out: &mut Vec<u8>) -> Range<usize> {
     let split = start + offset + 2;
     let at = out.len();
-    out.extend_from_slice(&data[..split]);
+    each_in(packet, 0..split, |bytes| out.extend_from_slice(bytes));
     let header = &mut out[at..];
-    let value = Sum::ZERO.bytes(&header[start..]).bytes(&data[split..]).checksum();
+    let value = sum_in(packet, split..total, Sum::ZERO.bytes(&header[start..])).checksum();
     write_u16(header, start + offset, value);
-    split..data.len()
+    split..total
 }
 
 /// What is left of a frame after [`take_first`] took its first packet: the bytes from `skip` on,
@@ -537,7 +552,7 @@ pub(crate) mod tests {
                 let copied: Vec<Vec<u8>> = (0..cut.count)
                     .map(|index| {
                         let at = headers.len();
-                        let body = cut.copy_header(index, &whole, &mut headers);
+                        let body = cut.copy_header(index, &Packet::new(&whole), &mut headers);
                         [&headers[at..], &whole[body]].concat()
                     })
                     .collect();
@@ -596,7 +611,7 @@ pub(crate) mod tests {
         let partial = info.pseudo(&p, p.len() - info.transport).fold();
         write_u16(&mut p, info.transport + 16, partial);
         let mut out = Vec::new();
-        let rest = complete_into(&p, info.transport, 16, &mut out);
+        let rest = complete_into(&Packet::new(&p), p.len(), info.transport, 16, &mut out);
         assert_eq!([&out[..], &p[rest]].concat(), expected);
     }
 

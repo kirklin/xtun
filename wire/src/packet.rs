@@ -1,4 +1,5 @@
 use std::io;
+use std::ops::Range;
 
 use crate::checksum::Sum;
 
@@ -81,6 +82,178 @@ impl<'a> Packet<'a> {
     }
 }
 
+/// A packet to write whose bytes come in pieces, the way a stack keeps what it sends: the
+/// headers it made for the packet and the payload where it lies. Nothing is joined before the
+/// write.
+#[derive(Debug)]
+pub struct Pieces<'a, B = &'a [u8]> {
+    /// The first bytes of the packet. Packets are joined into a segment only when their link
+    /// layer, IP and transport headers lie here.
+    pub head: &'a [u8],
+    /// The bytes that follow the head, in order. Empty pieces are passed over.
+    pub body: &'a [B],
+    /// How far the transport checksum is done.
+    pub checksum: Checksum,
+    /// Set for a segment larger than the MTU, which needs a [`Checksum::Partial`].
+    pub gso: Option<Gso>,
+}
+
+impl<'a, B> Pieces<'a, B> {
+    /// A packet whose checksums have not been checked.
+    pub fn new(head: &'a [u8], body: &'a [B]) -> Pieces<'a, B> {
+        Pieces { head, body, checksum: Checksum::Unverified, gso: None }
+    }
+
+    /// Says how far the checksum is done.
+    pub fn with_checksum(self, checksum: Checksum) -> Pieces<'a, B> {
+        Pieces { checksum, ..self }
+    }
+
+    /// Marks the packet as a segment that still has to be cut.
+    pub fn with_gso(self, gso: Gso) -> Pieces<'a, B> {
+        Pieces { gso: Some(gso), ..self }
+    }
+}
+
+impl<B> Clone for Pieces<'_, B> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<B> Copy for Pieces<'_, B> {}
+
+/// A packet to write as a [`crate::Plan`] takes it: a head and the pieces that follow it.
+/// [`Packet`] and [`Pieces`] are the two kinds.
+pub trait Parts {
+    /// The first bytes of the packet, where its headers are read.
+    fn head(&self) -> &[u8];
+
+    /// How many pieces follow the head.
+    fn pieces(&self) -> usize;
+
+    /// Piece `index` of those that follow the head.
+    fn piece(&self, index: usize) -> &[u8];
+
+    /// How far the transport checksum is done.
+    fn checksum(&self) -> Checksum;
+
+    /// Set for a segment larger than the MTU.
+    fn gso(&self) -> Option<Gso>;
+}
+
+impl Parts for Packet<'_> {
+    #[inline]
+    fn head(&self) -> &[u8] {
+        self.data
+    }
+
+    #[inline]
+    fn pieces(&self) -> usize {
+        0
+    }
+
+    #[inline]
+    fn piece(&self, _index: usize) -> &[u8] {
+        &[]
+    }
+
+    #[inline]
+    fn checksum(&self) -> Checksum {
+        self.checksum
+    }
+
+    #[inline]
+    fn gso(&self) -> Option<Gso> {
+        self.gso
+    }
+}
+
+impl<B: AsRef<[u8]>> Parts for Pieces<'_, B> {
+    #[inline]
+    fn head(&self) -> &[u8] {
+        self.head
+    }
+
+    #[inline]
+    fn pieces(&self) -> usize {
+        self.body.len()
+    }
+
+    #[inline]
+    fn piece(&self, index: usize) -> &[u8] {
+        self.body[index].as_ref()
+    }
+
+    #[inline]
+    fn checksum(&self) -> Checksum {
+        self.checksum
+    }
+
+    #[inline]
+    fn gso(&self) -> Option<Gso> {
+        self.gso
+    }
+}
+
+/// How many bytes `packet` has in all.
+pub(crate) fn total(packet: &impl Parts) -> usize {
+    packet.head().len() + (0..packet.pieces()).map(|index| packet.piece(index).len()).sum::<usize>()
+}
+
+/// The first byte of `packet`, wherever it lies.
+pub(crate) fn first_byte(packet: &impl Parts) -> Option<u8> {
+    packet.head().first().copied().or_else(|| (0..packet.pieces()).find_map(|index| packet.piece(index).first().copied()))
+}
+
+/// Hands `each` the bytes of `packet` from `range.start` up to `range.end`, or to the packet's
+/// end if that comes first, as the stretches they lie in, in order. No stretch is empty.
+#[inline]
+pub(crate) fn each_in<'a, P: Parts>(packet: &'a P, range: Range<usize>, mut each: impl FnMut(&'a [u8])) {
+    let head = packet.head();
+    if range.start < head.len() && range.start < range.end {
+        each(&head[range.start..range.end.min(head.len())]);
+    }
+    let mut at = head.len();
+    for index in 0..packet.pieces() {
+        if at >= range.end {
+            break;
+        }
+        let bytes = packet.piece(index);
+        let (from, to) = (range.start.saturating_sub(at).min(bytes.len()), (range.end - at).min(bytes.len()));
+        if from < to {
+            each(&bytes[from..to]);
+        }
+        at += bytes.len();
+    }
+}
+
+/// Adds the bytes of `packet` in `range` to `sum`.
+pub(crate) fn sum_in(packet: &impl Parts, range: Range<usize>, sum: Sum) -> Sum {
+    let mut sum = sum;
+    each_in(packet, range, |bytes| sum = sum.bytes(bytes));
+    sum
+}
+
+/// The first bytes of a packet, where its headers lie, and how long the packet is in all.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Head<'a> {
+    pub bytes: &'a [u8],
+    pub len: usize,
+}
+
+impl<'a> Head<'a> {
+    /// A packet that lies in one stretch.
+    pub fn whole(data: &'a [u8]) -> Head<'a> {
+        Head { bytes: data, len: data.len() }
+    }
+
+    /// The head of `packet`.
+    pub fn of(packet: &'a impl Parts) -> Head<'a> {
+        Head { bytes: packet.head(), len: total(packet) }
+    }
+}
+
 pub(crate) const TCP: u8 = 6;
 pub(crate) const UDP: u8 = 17;
 pub(crate) const TCP_CHECKSUM: usize = 16;
@@ -106,9 +279,18 @@ pub(crate) struct Transport {
 }
 
 impl Transport {
-    /// Reads a packet whose IP header starts at `link`.
+    /// Reads a packet that lies in one stretch.
+    #[cfg(test)]
     pub fn read(p: &[u8], link: usize) -> Option<Transport> {
+        Transport::read_head(Head::whole(p), link)
+    }
+
+    /// Reads a packet whose IP header starts at `link` from its head. A packet whose headers
+    /// go on past its head counts as none that can be read.
+    pub fn read_head(head: Head<'_>, link: usize) -> Option<Transport> {
+        let p = head.bytes;
         let ip = p.get(link..)?;
+        let ip_total = head.len - link;
         let (v6, ip_len, protocol) = match ip.first()? >> 4 {
             4 => {
                 if ip.len() < 20 {
@@ -117,13 +299,13 @@ impl Transport {
                 let ip_len = usize::from(ip[0] & 0x0f) * 4;
                 let total = usize::from(u16::from_be_bytes([ip[2], ip[3]]));
                 let fragment = ip[6] & 0x3f != 0 || ip[7] != 0;
-                if ip_len < 20 || total != ip.len() || fragment {
+                if ip_len < 20 || total != ip_total || fragment {
                     return None;
                 }
                 (false, ip_len, ip[9])
             }
             6 => {
-                if ip.len() < 40 || 40 + usize::from(u16::from_be_bytes([ip[4], ip[5]])) != ip.len() {
+                if ip.len() < 40 || 40 + usize::from(u16::from_be_bytes([ip[4], ip[5]])) != ip_total {
                     return None;
                 }
                 (true, 40, ip[6])
@@ -141,7 +323,7 @@ impl Transport {
             }
             UDP => {
                 let length = u16::from_be_bytes([*p.get(transport + 4)?, *p.get(transport + 5)?]);
-                if usize::from(length) != p.len() - transport {
+                if usize::from(length) != head.len.checked_sub(transport)? {
                     return None;
                 }
                 transport + 8
@@ -166,11 +348,19 @@ impl Transport {
 
     /// Whether the transport checksum of a complete packet is right. An IPv4 UDP packet without
     /// a checksum counts as right.
+    #[cfg(test)]
     pub fn verify(&self, p: &[u8]) -> bool {
-        if !self.tcp && !self.v6 && p[self.transport + 6..self.transport + 8] == [0, 0] {
+        self.verify_parts(&Packet::new(p), p.len())
+    }
+
+    /// Whether the transport checksum of a complete packet of `total` bytes is right. An IPv4
+    /// UDP packet without a checksum counts as right.
+    pub fn verify_parts(&self, packet: &impl Parts, total: usize) -> bool {
+        let head = packet.head();
+        if !self.tcp && !self.v6 && head[self.transport + 6..self.transport + 8] == [0, 0] {
             return true;
         }
-        self.pseudo(p, p.len() - self.transport).bytes(&p[self.transport..]).fold() == 0xffff
+        sum_in(packet, self.transport..total, self.pseudo(head, total - self.transport)).fold() == 0xffff
     }
 }
 
@@ -186,12 +376,18 @@ pub(crate) fn pseudo(ip: &[u8], v6: bool, protocol: u8, length: usize) -> Sum {
 /// Where the IP header starts in an Ethernet frame: after the addresses, any VLAN tags and the
 /// type. `None` for a frame that does not carry IPv4 or IPv6.
 pub(crate) fn link_len(frame: &[u8]) -> Option<usize> {
+    link_len_head(Head::whole(frame))
+}
+
+/// [`link_len`] for a frame whose link layer header lies in its head.
+pub(crate) fn link_len_head(head: Head<'_>) -> Option<usize> {
+    let frame = head.bytes;
     let mut at = 12;
     loop {
         let kind = u16::from_be_bytes([*frame.get(at)?, *frame.get(at + 1)?]);
         match kind {
             0x8100 | 0x88a8 | 0x9100 => at += 4,
-            0x0800 | 0x86dd if frame.len() > at + 2 => return Some(at + 2),
+            0x0800 | 0x86dd if head.len > at + 2 => return Some(at + 2),
             _ => return None,
         }
     }
