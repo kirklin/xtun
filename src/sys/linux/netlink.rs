@@ -1,7 +1,8 @@
 //! Interface configuration over rtnetlink: links, addresses and routes.
 
 use std::io;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
+use std::time::{Duration, Instant};
 
 use ipnet::IpNet;
 use netlink_packet_core::{
@@ -15,6 +16,9 @@ use netlink_sys::protocols::NETLINK_ROUTE;
 use netlink_sys::{Socket, SocketAddr};
 
 use crate::device::Address;
+
+/// How long to wait for the kernel to deliver the packets for a new IPv6 address.
+const DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) struct Netlink {
     socket: Socket,
@@ -128,7 +132,42 @@ impl Netlink {
             flags |= AddressFlags::Noprefixroute;
         }
         message.attributes.push(AddressAttribute::Flags(flags));
-        self.request(RouteNetlinkMessage::NewAddress(message), NLM_F_CREATE | NLM_F_EXCL).map(drop)
+        self.request(RouteNetlinkMessage::NewAddress(message), NLM_F_CREATE | NLM_F_EXCL)?;
+        if let IpAddr::V6(address) = net.addr() {
+            self.await_delivery(index, address)?;
+        }
+        Ok(())
+    }
+
+    /// Waits until the kernel delivers the packets for an IPv6 address of the interface to this
+    /// host. The address is there once the request to add it returns; the route that delivers
+    /// its packets follows from a task of the kernel's own, and a packet that comes before that
+    /// is dropped as one to forward.
+    fn await_delivery(&mut self, index: u32, address: Ipv6Addr) -> io::Result<()> {
+        let start = Instant::now();
+        loop {
+            let mut message = RouteMessage::default();
+            message.header.address_family = AddressFamily::Inet6;
+            message.header.destination_prefix_length = 128;
+            message.attributes.push(RouteAttribute::Destination(RouteAddress::from(IpAddr::V6(address))));
+            message.attributes.push(RouteAttribute::Oif(index));
+            // Until the route is there, the kernel answers with another route or with none.
+            let answer = self.request(RouteNetlinkMessage::GetRoute(message), 0);
+            let delivered = answer.as_ref().is_ok_and(|replies| {
+                replies.iter().any(|reply| matches!(reply, RouteNetlinkMessage::NewRoute(route) if route.header.kind == RouteType::Local))
+            });
+            if delivered {
+                return Ok(());
+            }
+            if start.elapsed() >= DELIVERY_TIMEOUT {
+                let answer = match answer {
+                    Ok(_) => "a route to elsewhere".to_owned(),
+                    Err(error) => error.to_string(),
+                };
+                return Err(io::Error::new(io::ErrorKind::TimedOut, format!("the kernel does not deliver packets for {address} to this host: {answer}")));
+            }
+            std::thread::sleep(Duration::from_micros(200));
+        }
     }
 
     pub fn remove_address(&mut self, index: u32, net: IpNet) -> io::Result<()> {
