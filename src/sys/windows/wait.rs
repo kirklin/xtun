@@ -284,31 +284,35 @@ pub(crate) fn wait(event: Option<HANDLE>, signal: Option<&Signal>, deadline: Opt
     if let Some(event) = event {
         handles.push(event);
     }
-    let left = deadline.map(|deadline| {
-        let left = deadline.saturating_duration_since(Instant::now());
-        // Rounded up, so that a wait never ends before its deadline.
-        left.as_nanos().div_ceil(1_000_000).min(u128::from(INFINITE - 1)) as u32
-    });
-    if left == Some(0) {
-        return Err(Error::new(ErrorKind::TimedOut, "the wait timed out"));
-    }
-    let timeout = match (left, limit) {
-        (Some(left), Some(limit)) => left.min(limit),
-        (Some(left), None) => left,
-        (None, Some(limit)) => limit,
-        (None, None) => INFINITE,
-    };
-    if handles.is_empty() {
-        std::thread::sleep(std::time::Duration::from_millis(u64::from(timeout)));
-        return Ok(());
-    }
-    // SAFETY: every handle is open for the length of the call.
-    let result = unsafe { WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, timeout) };
-    match result {
-        WAIT_FAILED => Err(Error::last_os_error()),
-        WAIT_TIMEOUT if limit.is_some() && left.is_none_or(|left| left > timeout) => Ok(()),
-        WAIT_TIMEOUT => Err(Error::new(ErrorKind::TimedOut, "the wait timed out")),
-        index if signal.is_some() && index == WAIT_OBJECT_0 => Err(interrupted()),
-        _ => Ok(()),
+    loop {
+        let left = deadline.map(|deadline| {
+            let left = deadline.saturating_duration_since(Instant::now());
+            // Rounded up, so that a wait never ends before its deadline.
+            left.as_nanos().div_ceil(1_000_000).min(u128::from(INFINITE - 1)) as u32
+        });
+        if left == Some(0) {
+            return Err(Error::new(ErrorKind::TimedOut, "the wait timed out"));
+        }
+        let timeout = match (left, limit) {
+            (Some(left), Some(limit)) => left.min(limit),
+            (Some(left), None) => left,
+            (None, Some(limit)) => limit,
+            (None, None) => INFINITE,
+        };
+        if handles.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(u64::from(timeout)));
+            return Ok(());
+        }
+        // SAFETY: every handle is open for the length of the call.
+        let result = unsafe { WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, timeout) };
+        match result {
+            WAIT_FAILED => return Err(Error::last_os_error()),
+            WAIT_TIMEOUT if limit.is_some() && left.is_none_or(|left| left > timeout) => return Ok(()),
+            // The system counts a timeout in ticks of its clock and may end the wait up to a tick
+            // early: the wait goes on for what is left until the deadline.
+            WAIT_TIMEOUT => {}
+            index if signal.is_some() && index == WAIT_OBJECT_0 => return Err(interrupted()),
+            _ => return Ok(()),
+        }
     }
 }
