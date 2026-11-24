@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use xtun::checksum::{Sum, pseudo_v4, pseudo_v6};
-use xtun::{Checksum, Layer, OwnedFrame, Packet, Pieces, Reader, Writer};
+use xtun::{Checksum, Layer, OwnedFrame, Packet, Pieces, Reader, Writer, WriterStats};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
@@ -31,12 +31,70 @@ pub struct Counters {
     pub packets: AtomicU64,
     /// Writes the writers made.
     pub writes: AtomicU64,
+    /// Writes the system refused, whose packets were lost.
+    pub refused: AtomicU64,
 }
 
 impl Counters {
     pub fn get(&self) -> (u64, u64, u64) {
         (self.segments.load(Ordering::Relaxed), self.packets.load(Ordering::Relaxed), self.writes.load(Ordering::Relaxed))
     }
+
+    /// What the reflectors of the interface `name` did and what the transfer lost, for the line
+    /// a test prints. `again` is how many segments TCP sent again meanwhile.
+    pub fn summary(&self, name: &str, again: u64) -> String {
+        let (segments, packets, writes) = self.get();
+        let refused = self.refused.load(Ordering::Relaxed);
+        format!("{segments} segments read, {packets} packets in {writes} writes, {refused} refused{}", lost(name, again))
+    }
+
+    /// Adds what a writer did between two readings of its statistics.
+    fn wrote(&self, before: WriterStats, after: WriterStats) {
+        self.packets.fetch_add(after.packets - before.packets, Ordering::Relaxed);
+        self.writes.fetch_add(after.writes - before.writes, Ordering::Relaxed);
+        self.refused.fetch_add(after.dropped - before.dropped, Ordering::Relaxed);
+    }
+}
+
+/// Whether the system is Linux, which Android is too.
+const LINUX: bool = cfg!(any(target_os = "linux", target_os = "android"));
+
+/// How many TCP segments the system has sent again so far, where any program can read that
+/// count: on Linux. Zero elsewhere.
+pub fn retransmitted() -> u64 {
+    if !LINUX {
+        return 0;
+    }
+    let counters = std::fs::read_to_string("/proc/net/snmp").unwrap();
+    let mut tcp = counters.lines().filter(|line| line.starts_with("Tcp:"));
+    let (names, values) = (tcp.next().unwrap(), tcp.next().unwrap());
+    let at = names.split_whitespace().position(|name| name == "RetransSegs").unwrap();
+    values.split_whitespace().nth(at).unwrap().parse().unwrap()
+}
+
+/// What a transfer through the interface `name` lost, as far as a Linux system counts it: the
+/// `again` segments that TCP sent again, the packets the interface dropped on their way to the
+/// device, and the written packets it dropped.
+fn lost(name: &str, again: u64) -> String {
+    if !LINUX {
+        return String::new();
+    }
+    let dropped = |way: &str| {
+        let count = std::fs::read_to_string(format!("/sys/class/net/{name}/statistics/{way}_dropped")).unwrap();
+        count.trim().parse::<u64>().unwrap()
+    };
+    format!("; {again} segments sent again, {} packets dropped on the way out and {} on the way in", dropped("tx"), dropped("rx"))
+}
+
+/// Checks that packets cut from segments were joined again: without joining every packet is a
+/// write of its own. How many packets go into a write depends on how many come together. A
+/// bare acknowledgement is joined with nothing. And once TCP has sent a segment again, as it
+/// does when a machine that stalls keeps its packets too long, it goes on in small segments,
+/// of which a packet or two come at a time: with `again` such segments the writes only have to
+/// be fewer than the packets, and without any each has to carry more than two.
+pub fn assert_joined(packets: u64, writes: u64, again: u64) {
+    let least = if again == 0 { writes * 2 } else { writes };
+    assert!(packets > least, "cut packets are joined again: {packets} packets in {writes} writes, {again} segments sent again");
 }
 
 /// An IP packet carrying TCP or UDP, every checksum complete.
@@ -251,9 +309,7 @@ async fn reflect_packets<L: Layer>(mut reader: Reader<L>, mut writer: Writer<L>,
             .collect();
         let before = writer.stats();
         writer.send(&packets).await?;
-        let after = writer.stats();
-        counters.packets.fetch_add(after.packets - before.packets, Ordering::Relaxed);
-        counters.writes.fetch_add(after.writes - before.writes, Ordering::Relaxed);
+        counters.wrote(before, writer.stats());
     }
 }
 
@@ -314,9 +370,7 @@ async fn reflect_kept<L: Layer>(mut reader: Reader<L>, mut writer: Writer<L>, na
             });
             let before = writer.stats();
             write_kept(&mut writer, frames, nat.link).await?;
-            let after = writer.stats();
-            counters.packets.fetch_add(after.packets - before.packets, Ordering::Relaxed);
-            counters.writes.fetch_add(after.writes - before.writes, Ordering::Relaxed);
+            counters.wrote(before, writer.stats());
         }
         Ok::<(), io::Error>(())
     };
@@ -415,9 +469,7 @@ pub async fn reflect<L: Layer>(mut reader: Reader<L>, mut writer: Writer<L>, nat
             }
             Mode::Packets | Mode::Kept => unreachable!("reflected by a function of its own"),
         }
-        let after = writer.stats();
-        counters.packets.fetch_add(after.packets - before.packets, Ordering::Relaxed);
-        counters.writes.fetch_add(after.writes - before.writes, Ordering::Relaxed);
+        counters.wrote(before, writer.stats());
     }
 }
 

@@ -292,9 +292,8 @@ async fn through_reflector<L: xtun::Layer>(queues: Vec<Queue<L>>, nat: Nat, mode
     let task = tokio::spawn(reflect(reader, writer, nat, mode, counters.clone()));
     transfer(nat, 16 << 20, 2).await;
     stop(vec![task]).await;
-    let (segments, packets, writes) = counters.get();
-    println!("{mode:?} {}: {segments} segments read, {packets} packets in {writes} writes", nat.local);
-    assert_eq!(segments, 0, "Windows adapters hand over no segments");
+    println!("{mode:?} {}: {}", nat.local, counters.summary("", 0));
+    assert_eq!(counters.get().0, 0, "Windows adapters hand over no segments");
 }
 
 /// The addresses of the reflector's subnet: the device's own, the one clients dial and the one

@@ -18,7 +18,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{Build, Counters, Mode, NEIGHBOR_MAC, Nat, ethernet, ip_packet, reflect, stop, transfer};
+use common::{Build, Counters, Mode, NEIGHBOR_MAC, Nat, assert_joined, ethernet, ip_packet, reflect, retransmitted, stop, transfer};
 use xtun::{Builder, Checksum, Ethernet, Packet, Queue, Reader, Tap, Writer};
 use ipnet::IpNet;
 use tokio::net::UdpSocket;
@@ -224,18 +224,18 @@ async fn through_reflector(offload: bool, mode: Mode, v6: bool) {
     let counters = Arc::new(Counters::default());
     let (reader, writer) = ends(queues);
     let task = tokio::spawn(reflect(reader, writer, nat, mode, counters.clone()));
+    let before = retransmitted();
     transfer(nat, 16 << 20, 2).await;
     stop(vec![task]).await;
+    let again = retransmitted() - before;
     let (segments, packets, writes) = counters.get();
-    println!("offload {offload} {mode:?} v6 {v6}: {segments} segments read, {packets} packets in {writes} writes");
+    println!("offload {offload} {mode:?} v6 {v6}: {}", counters.summary(&device.name().unwrap(), again));
     if offload && cfg!(any(target_os = "linux", target_os = "android", target_os = "freebsd", target_os = "openbsd")) {
         if mode != Mode::Packets {
             assert!(segments > 0, "the kernel hands over segments of Ethernet frames");
         }
         if matches!(mode, Mode::Split | Mode::Packets | Mode::Pieces) {
-            // Without joining every packet is a write of its own. How many packets go into a
-            // write depends on how many of them are bare acknowledgements, which nothing joins.
-            assert!(packets > writes * 2, "cut frames are joined again: {packets} packets in {writes} writes");
+            assert_joined(packets, writes, again);
         }
     } else {
         assert_eq!(segments, 0);

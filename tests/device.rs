@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
-use common::{Build, Counters, Mode, Nat, reflect, stop, transfer};
+use common::{Build, Counters, Mode, Nat, assert_joined, reflect, retransmitted, stop, transfer};
 use xtun::{Builder, Checksum, Packet, Queue, Reader, Tun, Writer};
 use ipnet::IpNet;
 use tokio::net::UdpSocket;
@@ -189,7 +189,7 @@ async fn through_reflector(offload: bool, mode: Mode, v6: bool, queues: usize, o
     let host = |number: u8| if v6 { format!("fd73:{subnet:x}::{number}") } else { format!("10.73.{subnet}.{number}") };
     let address = format!("{}/{}", host(1), if v6 { 64 } else { 24 });
     let builder = with_queues(builder("xtuntest2").address(net(&address)).offload(offload), queues);
-    let (_device, handed) = uring(builder, on).build().unwrap();
+    let (device, handed) = uring(builder, on).build().unwrap();
     assert_eq!(handed.len(), queues);
     let nat = Nat { local: ip(&host(1)), peer: ip(&host(2)), other: ip(&host(3)), link: 0 };
     let counters = Arc::new(Counters::default());
@@ -198,18 +198,18 @@ async fn through_reflector(offload: bool, mode: Mode, v6: bool, queues: usize, o
         let (reader, writer) = queue.split().unwrap();
         tasks.push(tokio::spawn(reflect(reader, writer, nat, mode, counters.clone())));
     }
+    let before = retransmitted();
     transfer(nat, 16 << 20, queues * 2).await;
     stop(tasks).await;
+    let again = retransmitted() - before;
     let (segments, packets, writes) = counters.get();
-    println!("offload {offload} {mode:?} v6 {v6} queues {queues}: {segments} segments read, {packets} packets in {writes} writes");
+    println!("offload {offload} {mode:?} v6 {v6} queues {queues}: {}", counters.summary(&device.name().unwrap(), again));
     if offload && cfg!(any(target_os = "linux", target_os = "android", target_os = "openbsd")) {
         if mode != Mode::Packets {
             assert!(segments > 0, "the kernel hands over segments");
         }
         if matches!(mode, Mode::Split | Mode::Packets | Mode::Pieces) {
-            // Without joining every packet is a write of its own. How many packets go into a
-            // write depends on how many of them are bare acknowledgements, which nothing joins.
-            assert!(packets > writes * 2, "cut packets are joined again: {packets} packets in {writes} writes");
+            assert_joined(packets, writes, again);
         }
     } else {
         assert_eq!(segments, 0);
