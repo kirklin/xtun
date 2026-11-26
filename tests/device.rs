@@ -392,7 +392,8 @@ async fn tcp_through_four_queues() {
 #[ignore = "creates interfaces: run as root with --ignored"]
 async fn interfaces_are_made_one_right_after_another() {
     for round in 0..50u64 {
-        let made = Tun::builder().address(net("10.74.9.1/24")).build();
+        // Each interface has a subnet of its own: the one before may still be there.
+        let made = Tun::builder().address(net(&format!("10.73.{round}.1/24"))).build();
         let (device, queues) = made.unwrap_or_else(|error| panic!("interface {round}: {error}"));
         // As in a program whose tasks hold the queues: they go a moment after the device, and
         // the next interface may be made before or after.
