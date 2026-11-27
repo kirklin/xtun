@@ -13,7 +13,7 @@
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use xtun::checksum::{Sum, pseudo_v4, pseudo_v6};
@@ -649,56 +649,129 @@ pub async fn transfer(nat: Nat, size: u64, connections: usize) {
 const WRITERS: usize = 4;
 /// How many datagrams each of them sends in a round, two with every call.
 const EACH: u32 = 50;
+/// How many datagrams of a round are on their way at most: so few that no queue of the system
+/// and no buffer of the socket fills up, however slowly the socket is read.
+const ON_THE_WAY: u64 = 16;
+
+/// What the writers of a round of [`several_writers`] and whoever reads its datagrams share.
+#[derive(Default)]
+struct Round {
+    /// Datagrams handed to writers.
+    sent: AtomicU64,
+    /// Datagrams read from the socket.
+    arrived: AtomicU64,
+    /// Nothing more is read: the writers stop.
+    over: AtomicBool,
+}
+
+impl Round {
+    /// Whether a writer has to hold its next two datagrams back for now.
+    fn is_full(&self) -> bool {
+        self.sent.load(Ordering::SeqCst) - self.arrived.load(Ordering::SeqCst) >= ON_THE_WAY
+    }
+
+    fn is_over(&self) -> bool {
+        self.over.load(Ordering::SeqCst)
+    }
+
+    /// Reads the datagrams of round `number` until all of them have arrived, or none has for
+    /// five seconds. Returns the numbers of the datagrams of each writer in the order in which
+    /// they arrived.
+    fn arrivals(&self, socket: &std::net::UdpSocket, number: u8) -> Vec<Vec<u32>> {
+        let mut arrived = vec![Vec::new(); WRITERS];
+        let mut datagram = [0u8; 16];
+        let mut count = 0;
+        while count < WRITERS as u32 * EACH {
+            match socket.recv_from(&mut datagram) {
+                Ok((6, _)) if datagram[0] == number => {
+                    arrived[usize::from(datagram[1])].push(u32::from_be_bytes(datagram[2..6].try_into().unwrap()));
+                    count += 1;
+                    self.arrived.fetch_add(1, Ordering::SeqCst);
+                }
+                // A probe that was still on its way.
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        self.over.store(true, Ordering::SeqCst);
+        arrived
+    }
+}
 
 /// The two datagrams of one call in a round of [`several_writers`], as the device takes them.
 fn pair(wrap: &(impl Fn(&[u8]) -> Vec<u8> + ?Sized), round: u8, writer: usize, first: u32) -> [Vec<u8>; 2] {
     [first, first + 1].map(|number| wrap(&[&[round, writer as u8][..], &number.to_be_bytes()].concat()))
 }
 
-/// Reads the datagrams of one round of [`several_writers`]: those of each writer arrive in the
-/// order it sent them, and none is missing.
-fn arrive_in_order(socket: &std::net::UdpSocket, round: u8) {
-    let mut next = [0u32; WRITERS];
-    let mut datagram = [0u8; 16];
-    for _ in 0..WRITERS as u32 * EACH {
-        let (size, _) = socket.recv_from(&mut datagram).expect("every datagram arrives within the timeout");
-        assert_eq!((size, datagram[0]), (6, round));
-        let writer = usize::from(datagram[1]);
-        let number = u32::from_be_bytes(datagram[2..6].try_into().unwrap());
-        assert_eq!(number, next[writer], "the datagrams of writer {writer} arrive in the order it sent them");
-        next[writer] += 1;
-    }
+/// The datagrams of every writer arrived in the order in which it sent them, none missing.
+fn arrived_in_order<L: Layer>(arrived: &[Vec<u32>], writers: &[Writer<L>]) {
+    let all: Vec<u32> = (0..EACH).collect();
+    let stats: Vec<WriterStats> = writers.iter().map(Writer::stats).collect();
+    assert!(arrived.iter().all(|numbers| *numbers == all), "the datagrams of each writer, as they arrived: {arrived:?}; what the writers did: {stats:?}");
 }
 
 /// Four writers of one queue, `writer` and three made of it, send datagrams to `socket` at the
 /// same time: first each on a thread of its own with blocking calls, then each in a task of its
 /// own. `wrap` puts a payload into a datagram for the socket, as the device takes it.
 pub async fn several_writers<L: Layer>(writer: Writer<L>, socket: std::net::UdpSocket, wrap: impl Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static) {
-    socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     let mut writers = vec![writer];
     for _ in 1..WRITERS {
         writers.push(writers[0].try_clone().unwrap());
     }
-    std::thread::scope(|scope| {
+    // A system may drop what arrives on an interface for a while after the interface was made:
+    // a probe goes in until one comes out of the socket.
+    socket.set_read_timeout(Some(Duration::from_millis(250))).unwrap();
+    let probe = wrap(&[0xff]);
+    let mut heard = false;
+    for _ in 0..120 {
+        writers[0].blocking_send(&[Packet::new(&probe).with_checksum(Checksum::Valid)]).unwrap();
+        if matches!(socket.recv_from(&mut [0u8; 16]), Ok((1, _))) {
+            heard = true;
+            break;
+        }
+    }
+    assert!(heard, "nothing the writer sends reaches the socket in half a minute: {:?}", writers[0].stats());
+    let probes = writers[0].stats().packets;
+    socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    let round = Round::default();
+    let arrived = std::thread::scope(|scope| {
         for (index, writer) in writers.iter_mut().enumerate() {
-            let wrap = &wrap;
+            let (wrap, round) = (&wrap, &round);
             scope.spawn(move || {
                 for first in (0..EACH).step_by(2) {
+                    while round.is_full() && !round.is_over() {
+                        std::thread::yield_now();
+                    }
+                    if round.is_over() {
+                        return;
+                    }
+                    round.sent.fetch_add(2, Ordering::SeqCst);
                     let [one, two] = pair(wrap, 0, index, first);
                     writer.blocking_send(&[Packet::new(&one).with_checksum(Checksum::Valid), Packet::new(&two).with_checksum(Checksum::Valid)]).unwrap();
                 }
             });
         }
-        arrive_in_order(&socket, 0);
+        round.arrivals(&socket, 0)
     });
+    arrived_in_order(&arrived, &writers);
+
     let wrap = Arc::new(wrap);
+    let round = Arc::new(Round::default());
     let tasks: Vec<_> = writers
         .into_iter()
         .enumerate()
         .map(|(index, mut writer)| {
-            let wrap = wrap.clone();
+            let (wrap, round) = (wrap.clone(), round.clone());
             tokio::spawn(async move {
                 for first in (0..EACH).step_by(2) {
+                    while round.is_full() && !round.is_over() {
+                        tokio::task::yield_now().await;
+                    }
+                    if round.is_over() {
+                        break;
+                    }
+                    round.sent.fetch_add(2, Ordering::SeqCst);
                     let [one, two] = pair(&*wrap, 1, index, first);
                     writer.send(&[Packet::new(&one).with_checksum(Checksum::Valid), Packet::new(&two).with_checksum(Checksum::Valid)]).await.unwrap();
                 }
@@ -706,10 +779,15 @@ pub async fn several_writers<L: Layer>(writer: Writer<L>, socket: std::net::UdpS
             })
         })
         .collect();
-    tokio::task::block_in_place(|| arrive_in_order(&socket, 1));
+    let arrived = tokio::task::block_in_place(|| round.arrivals(&socket, 1));
+    let mut writers = Vec::new();
     for task in tasks {
-        let stats = task.await.unwrap().stats();
-        assert_eq!((stats.packets, stats.dropped), (u64::from(EACH) * 2, 0), "every writer counts what it wrote itself");
+        writers.push(task.await.unwrap());
+    }
+    arrived_in_order(&arrived, &writers);
+    for (index, writer) in writers.iter().enumerate() {
+        let (stats, own) = (writer.stats(), if index == 0 { probes } else { 0 });
+        assert_eq!((stats.packets - own, stats.dropped), (u64::from(EACH) * 2, 0), "every writer counts what it wrote itself");
     }
 }
 
