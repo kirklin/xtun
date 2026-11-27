@@ -6,6 +6,7 @@ use std::io::{ErrorKind, Result};
 #[cfg(target_os = "macos")]
 use std::ops::Range;
 use std::os::fd::RawFd;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use xtun_wire::Writes as List;
 
@@ -104,15 +105,21 @@ impl Read for MessageReads {
 
 /// Writes a utun socket: a write per message, its pieces gathered, and up to 256 messages per
 /// `sendmsg_x`.
+///
+/// The writers of one socket take turns at the call. The system says of a `sendmsg_x` that
+/// meets another on the same socket that it took every message, and now and then delivers
+/// none of them.
 #[derive(Default)]
 pub struct MessageWrites {
     iov: IoVecs,
     headers: Headers,
+    /// Held for the length of a call, by whichever writer of the socket makes it.
+    turn: Arc<Mutex<()>>,
 }
 
 impl Write for MessageWrites {
     fn write(&mut self, fd: RawFd, list: &impl List, stats: &mut WriterStats) -> Result<usize> {
-        let MessageWrites { iov, headers } = self;
+        let MessageWrites { iov, headers, turn } = self;
         let total = list.count();
         let mut next = 0;
         while next < total {
@@ -123,7 +130,10 @@ impl Write for MessageWrites {
                 headers.push(iov.gather(list, index));
             }
             headers.link(iov.as_ptr().cast_mut(), iov.len());
-            let sent = send(fd, &headers.0, stats);
+            let sent = {
+                let _turn = turn.lock().unwrap_or_else(PoisonError::into_inner);
+                send(fd, &headers.0, stats)
+            };
             iov.clear();
             headers.0.clear();
             let sent = sent?;
@@ -136,7 +146,7 @@ impl Write for MessageWrites {
     }
 
     fn try_clone(&self) -> Result<MessageWrites> {
-        Ok(MessageWrites::default())
+        Ok(MessageWrites { turn: self.turn.clone(), ..MessageWrites::default() })
     }
 }
 
@@ -330,6 +340,35 @@ mod tests {
         let (found, filled) = read(&mut reads, &far, &mut slots, 8, &mut reader);
         assert!(found.is_empty() && filled.dry && filled.error.is_none());
         assert_eq!(reader.calls, 3);
+    }
+
+    #[test]
+    fn the_writers_of_a_socket_take_turns() {
+        let (near, far) = pair();
+        let first = MessageWrites::default();
+        let mut second = first.try_clone().unwrap();
+        // Messages on the other socket, without waiting for one.
+        let waiting = || {
+            let mut message = [0u8; 64];
+            // SAFETY: `message` is writable for its length.
+            unsafe { libc::recv(far.as_raw_fd(), message.as_mut_ptr().cast(), message.len(), libc::MSG_DONTWAIT) }
+        };
+        // While one writer is at its call, the other waits for its turn.
+        let turn = first.turn.lock().unwrap();
+        std::thread::scope(|scope| {
+            let writing = scope.spawn(|| {
+                let list = Pieces(vec![vec![vec![0x45; 20]]]);
+                second.write(near.as_raw_fd(), &list, &mut WriterStats::default()).unwrap()
+            });
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(waiting() < 0, "nothing is written out of turn");
+            drop(turn);
+            assert_eq!(writing.join().unwrap(), 1);
+        });
+        assert_eq!(waiting(), 20);
+        // A writer of another socket has turns of its own.
+        assert!(first.turn.try_lock().is_ok());
+        assert!(MessageWrites::default().turn.try_lock().is_ok());
     }
 
     #[test]

@@ -795,6 +795,9 @@ impl<L: Layer> Writer<L> {
     /// writers there is no order: a flow whose packets have to arrive in order goes through
     /// one writer at a time, and moves to another only once [`Writer::writable`] has said that
     /// the device took everything the first was given.
+    ///
+    /// On the Apple systems the writers of a TUN interface take turns at the system call:
+    /// the system loses packets that are written to a utun socket at the same time.
     pub fn try_clone(&self) -> io::Result<Writer<L>> {
         Ok(Writer {
             sink: self.sink.try_clone()?,
