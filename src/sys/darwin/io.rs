@@ -134,6 +134,10 @@ impl Write for MessageWrites {
         }
         Ok(next)
     }
+
+    fn try_clone(&self) -> Result<MessageWrites> {
+        Ok(MessageWrites::default())
+    }
 }
 
 /// Sends the messages in order until the socket has no room. Returns how many it took, those
@@ -255,6 +259,10 @@ impl Write for BpfWrites {
             }
         }
         Ok(list.count())
+    }
+
+    fn try_clone(&self) -> Result<BpfWrites> {
+        Ok(BpfWrites::default())
     }
 }
 

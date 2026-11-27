@@ -3,9 +3,10 @@
 //! A [`Tun`] interface carries IP packets, on Linux, Android, the Apple systems, FreeBSD, NetBSD,
 //! OpenBSD, illumos and Windows; a [`Tap`] interface carries Ethernet frames, on Linux, macOS,
 //! the BSDs and Windows. Building one gives a handle to configure the interface and its
-//! [`Queue`]s; each queue splits, once, into a [`Reader`] and a [`Writer`]. Frames are read and
-//! written a batch at a time or one packet at a time, asynchronously on Tokio or async-io, or
-//! blocking the thread. On Linux and OpenBSD, and for TAP interfaces on FreeBSD, the system
+//! [`Queue`]s; each queue splits, once, into a [`Reader`] and a [`Writer`], and
+//! [`Writer::try_clone`] gives one more writer of the queue to every thread that writes at the
+//! same time. Frames are read and written a batch at a time or one packet at a time,
+//! asynchronously on Tokio or async-io, or blocking the thread. On Linux and OpenBSD, and for TAP interfaces on FreeBSD, the system
 //! hands over TCP segments of up to 64 KiB at once and takes them back the same way, and on
 //! Linux UDP segments too; [`Frame::segments`] cuts such a segment into ordinary packets inside
 //! the buffer it was read into, and the writer joins consecutive packets of a flow into one

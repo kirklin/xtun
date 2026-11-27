@@ -18,7 +18,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::{Build, Counters, Mode, NEIGHBOR_MAC, Nat, assert_joined, ethernet, ip_packet, reflect, retransmitted, stop, transfer};
+use common::{Build, Counters, Mode, NEIGHBOR_MAC, Nat, assert_joined, ethernet, ip_packet, reflect, retransmitted, several_writers, stop, transfer};
 use xtun::{Builder, Checksum, Ethernet, Packet, Queue, Reader, Tap, Writer};
 use ipnet::IpNet;
 use tokio::net::UdpSocket;
@@ -210,6 +210,18 @@ async fn udp_round_trip_plain() {
 #[ignore = "creates interfaces: run as root with --ignored"]
 async fn udp_round_trip_offload() {
     udp_round_trip("xtuntap0", true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "creates interfaces: run as root with --ignored"]
+async fn a_queue_takes_frames_from_several_writers() {
+    let (device, queues) = builder("xtuntap0").address(net("10.98.0.1/24")).build().unwrap();
+    assert_eq!(device.mac_address().unwrap(), DEVICE_MAC);
+    let (_reader, writer) = ends(queues);
+    let socket = std::net::UdpSocket::bind("10.98.0.1:0").unwrap();
+    let port = socket.local_addr().unwrap().port();
+    let from = Build { src: ip("10.98.0.2"), dst: ip("10.98.0.1"), src_port: 9, dst_port: port, ttl: 64, id: 3 };
+    several_writers(writer, socket, move |payload| ethernet(DEVICE_MAC, NEIGHBOR_MAC, &from.udp(payload))).await;
 }
 
 async fn through_reflector(offload: bool, mode: Mode, v6: bool) {

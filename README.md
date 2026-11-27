@@ -28,7 +28,7 @@ async fn example() -> std::io::Result<()> {
 }
 ```
 
-Every read and write comes as an `async` method, a `poll_` method, a `try_` method that never waits and a `blocking_` method that needs no runtime. `Device::from_fd` wraps a descriptor that something else opened, such as the one Android or an iOS packet tunnel hands to an application.
+Every read and write comes as an `async` method, a `poll_` method, a `try_` method that never waits and a `blocking_` method that needs no runtime. A queue has one reader and takes packets from several threads at once: `Writer::try_clone` gives each of them a writer of its own, which keeps the order of the packets it is given. `Device::from_fd` wraps a descriptor that something else opened, such as the one Android or an iOS packet tunnel hands to an application.
 
 ## Frames that stay, packets in pieces
 

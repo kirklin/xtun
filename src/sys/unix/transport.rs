@@ -95,6 +95,11 @@ pub trait Write: Send + 'static {
     /// Hands the device the writes of `list` in order, without waiting, until it takes no more,
     /// and returns how many it took.
     fn write(&mut self, fd: RawFd, list: &impl Writes, stats: &mut WriterStats) -> io::Result<usize>;
+
+    /// The same way of writing for one more writer of the queue, with memory of its own.
+    fn try_clone(&self) -> io::Result<Self>
+    where
+        Self: Sized;
 }
 
 /// The reading end of a queue.
@@ -171,6 +176,10 @@ impl<T: Facts, W: Write> crate::io::Sink for Sink<T, W> {
 
     fn write(&mut self, list: &impl Writes, stats: &mut WriterStats) -> io::Result<usize> {
         self.writes.write(self.port.fd(), list, stats)
+    }
+
+    fn try_clone(&self) -> io::Result<Self> {
+        Ok(Sink { writes: self.writes.try_clone()?, port: self.port.for_writer()?, tunnel: self.tunnel.clone() })
     }
 }
 
@@ -278,6 +287,10 @@ impl Write for Gathered {
             }
         }
         Ok(list.count())
+    }
+
+    fn try_clone(&self) -> io::Result<Gathered> {
+        Ok(Gathered::default())
     }
 }
 

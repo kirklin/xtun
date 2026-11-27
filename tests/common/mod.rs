@@ -645,6 +645,74 @@ pub async fn transfer(nat: Nat, size: u64, connections: usize) {
     server.await.unwrap();
 }
 
+/// How many writers of one queue write at the same time in [`several_writers`].
+const WRITERS: usize = 4;
+/// How many datagrams each of them sends in a round, two with every call.
+const EACH: u32 = 50;
+
+/// The two datagrams of one call in a round of [`several_writers`], as the device takes them.
+fn pair(wrap: &(impl Fn(&[u8]) -> Vec<u8> + ?Sized), round: u8, writer: usize, first: u32) -> [Vec<u8>; 2] {
+    [first, first + 1].map(|number| wrap(&[&[round, writer as u8][..], &number.to_be_bytes()].concat()))
+}
+
+/// Reads the datagrams of one round of [`several_writers`]: those of each writer arrive in the
+/// order it sent them, and none is missing.
+fn arrive_in_order(socket: &std::net::UdpSocket, round: u8) {
+    let mut next = [0u32; WRITERS];
+    let mut datagram = [0u8; 16];
+    for _ in 0..WRITERS as u32 * EACH {
+        let (size, _) = socket.recv_from(&mut datagram).expect("every datagram arrives within the timeout");
+        assert_eq!((size, datagram[0]), (6, round));
+        let writer = usize::from(datagram[1]);
+        let number = u32::from_be_bytes(datagram[2..6].try_into().unwrap());
+        assert_eq!(number, next[writer], "the datagrams of writer {writer} arrive in the order it sent them");
+        next[writer] += 1;
+    }
+}
+
+/// Four writers of one queue, `writer` and three made of it, send datagrams to `socket` at the
+/// same time: first each on a thread of its own with blocking calls, then each in a task of its
+/// own. `wrap` puts a payload into a datagram for the socket, as the device takes it.
+pub async fn several_writers<L: Layer>(writer: Writer<L>, socket: std::net::UdpSocket, wrap: impl Fn(&[u8]) -> Vec<u8> + Send + Sync + 'static) {
+    socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let mut writers = vec![writer];
+    for _ in 1..WRITERS {
+        writers.push(writers[0].try_clone().unwrap());
+    }
+    std::thread::scope(|scope| {
+        for (index, writer) in writers.iter_mut().enumerate() {
+            let wrap = &wrap;
+            scope.spawn(move || {
+                for first in (0..EACH).step_by(2) {
+                    let [one, two] = pair(wrap, 0, index, first);
+                    writer.blocking_send(&[Packet::new(&one).with_checksum(Checksum::Valid), Packet::new(&two).with_checksum(Checksum::Valid)]).unwrap();
+                }
+            });
+        }
+        arrive_in_order(&socket, 0);
+    });
+    let wrap = Arc::new(wrap);
+    let tasks: Vec<_> = writers
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut writer)| {
+            let wrap = wrap.clone();
+            tokio::spawn(async move {
+                for first in (0..EACH).step_by(2) {
+                    let [one, two] = pair(&*wrap, 1, index, first);
+                    writer.send(&[Packet::new(&one).with_checksum(Checksum::Valid), Packet::new(&two).with_checksum(Checksum::Valid)]).await.unwrap();
+                }
+                writer
+            })
+        })
+        .collect();
+    tokio::task::block_in_place(|| arrive_in_order(&socket, 1));
+    for task in tasks {
+        let stats = task.await.unwrap().stats();
+        assert_eq!((stats.packets, stats.dropped), (u64::from(EACH) * 2, 0), "every writer counts what it wrote itself");
+    }
+}
+
 /// Stops tasks and waits until they are dropped, so their queues close.
 pub async fn stop(tasks: Vec<JoinHandle<io::Result<()>>>) {
     for task in tasks {

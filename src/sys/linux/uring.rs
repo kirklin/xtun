@@ -175,6 +175,10 @@ impl Write for Writes {
             _ => self.each.write(fd, list, stats),
         }
     }
+
+    fn try_clone(&self) -> Result<Writes> {
+        Writes::new(self.ring.is_some())
+    }
 }
 
 struct WriteRing {

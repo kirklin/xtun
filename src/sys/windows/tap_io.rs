@@ -310,6 +310,11 @@ impl crate::io::Sink for Sink {
         }
         Ok(list.count())
     }
+
+    /// One more set of overlapped writes on the adapter's file.
+    fn try_clone(&self) -> Result<Sink> {
+        Sink::new(self.tap.clone())
+    }
 }
 
 impl Drop for Sink {

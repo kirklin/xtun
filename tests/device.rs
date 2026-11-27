@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
-use common::{Build, Counters, Mode, Nat, assert_joined, reflect, retransmitted, stop, transfer};
+use common::{Build, Counters, Mode, Nat, assert_joined, reflect, retransmitted, several_writers, stop, transfer};
 use xtun::{Builder, Checksum, Packet, Queue, Reader, Tun, Writer};
 use ipnet::IpNet;
 use tokio::net::UdpSocket;
@@ -421,6 +421,17 @@ async fn a_device_hands_out_its_queues_once() {
     let (_other, mut queues) = builder("xtuntest20").address(net("10.74.1.1/24")).build().unwrap();
     let refused = queues.remove(0).split_with_capacity(0).unwrap_err();
     assert_eq!(refused.kind(), io::ErrorKind::InvalidInput, "a batch holds at least one frame");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "creates interfaces: run as root with --ignored"]
+async fn a_queue_takes_packets_from_several_writers() {
+    let (_device, queues) = builder("xtuntest21").address(net("10.97.0.1/24")).build().unwrap();
+    let (_reader, writer) = ends(queues);
+    let socket = std::net::UdpSocket::bind("10.97.0.1:0").unwrap();
+    let port = socket.local_addr().unwrap().port();
+    let from = Build { src: ip("10.97.0.2"), dst: ip("10.97.0.1"), src_port: 9, dst_port: port, ttl: 64, id: 3 };
+    several_writers(writer, socket, move |payload| from.udp(payload)).await;
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]

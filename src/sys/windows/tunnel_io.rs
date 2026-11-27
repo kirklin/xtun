@@ -259,6 +259,11 @@ impl crate::io::Sink for Sink {
         }
         Ok(list.count())
     }
+
+    /// Wintun takes packets for the send ring from any number of threads at once.
+    fn try_clone(&self) -> Result<Sink> {
+        Sink::new(self.tunnel.clone())
+    }
 }
 
 /// Room for one packet in the send ring, or `None` while the ring is full.

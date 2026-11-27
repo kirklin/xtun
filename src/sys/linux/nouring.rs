@@ -51,4 +51,8 @@ impl Write for Writes {
     fn write(&mut self, fd: RawFd, list: &impl List, stats: &mut WriterStats) -> Result<usize> {
         self.0.write(fd, list, stats)
     }
+
+    fn try_clone(&self) -> Result<Writes> {
+        Ok(Writes(Gathered::default()))
+    }
 }

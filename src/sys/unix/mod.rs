@@ -41,13 +41,30 @@ pub(crate) enum Reactor {
     AsyncIo(async_io::Async<Watched>),
 }
 
+/// What a reactor watches a descriptor for.
+#[derive(Clone, Copy)]
+enum Watches {
+    /// Readability: the descriptor never reports writability.
+    #[cfg(target_os = "macos")]
+    Read,
+    /// Readability and writability: the descriptor of a queue's reader and its first writer.
+    Both,
+    /// Writability: the descriptor of one more writer.
+    Write,
+}
+
 impl Reactor {
-    /// Watches `fd` for readability and, with `write`, writability.
-    fn new(fd: RawFd, write: bool) -> io::Result<Reactor> {
+    /// Watches `fd` for what `watches` says.
+    fn new(fd: RawFd, watches: Watches) -> io::Result<Reactor> {
         #[cfg(feature = "tokio")]
         if tokio::runtime::Handle::try_current().is_ok() {
             use tokio::io::Interest;
-            let interest = if write { Interest::READABLE | Interest::WRITABLE } else { Interest::READABLE };
+            let interest = match watches {
+                #[cfg(target_os = "macos")]
+                Watches::Read => Interest::READABLE,
+                Watches::Both => Interest::READABLE | Interest::WRITABLE,
+                Watches::Write => Interest::WRITABLE,
+            };
             // SAFETY: the queue keeps the descriptor open, and does not change what it refers
             // to, for as long as the reactor that holds the registration.
             let fd = unsafe { tokio::io::unix::AsyncFd::register_with_interest(Watched(fd), interest) }
@@ -55,7 +72,7 @@ impl Reactor {
             return Ok(Reactor::Tokio(fd));
         }
         // async-io watches for readability or writability only while a task waits for it.
-        let _ = write;
+        let _ = watches;
         #[cfg(feature = "async-io")]
         return Ok(Reactor::AsyncIo(async_io::Async::new_nonblocking(Watched(fd))?));
         #[cfg(not(feature = "async-io"))]
@@ -117,20 +134,34 @@ impl Reactor {
 pub(crate) struct Queue {
     reactor: Mutex<Option<Arc<Reactor>>>,
     fd: OwnedFd,
-    /// The descriptor reports writability, so writers can wait for it.
-    writable: bool,
+    /// What the reactor watches the descriptor for.
+    watches: Watches,
 }
 
 impl Queue {
     pub fn new(fd: OwnedFd) -> Queue {
-        Queue { reactor: Mutex::new(None), fd, writable: true }
+        Queue { reactor: Mutex::new(None), fd, watches: Watches::Both }
     }
 
     /// A queue whose descriptor reports only readability, such as a BPF device, whose writes
     /// never wait.
     #[cfg(target_os = "macos")]
     pub fn read_only_readiness(fd: OwnedFd) -> Queue {
-        Queue { writable: false, ..Queue::new(fd) }
+        Queue { watches: Watches::Read, ..Queue::new(fd) }
+    }
+
+    /// The same queue behind a descriptor of its own, for one more writer. A reactor wakes one
+    /// task that waits to write on a descriptor, so every writer that may wait at the same
+    /// time as another has its own descriptor and its own reactor, which watches for
+    /// writability alone: frames that arrive do not wake it.
+    pub fn for_writer(&self) -> io::Result<Queue> {
+        let watches = match self.watches {
+            // Such a queue's writers never wait.
+            #[cfg(target_os = "macos")]
+            Watches::Read => Watches::Read,
+            Watches::Both | Watches::Write => Watches::Write,
+        };
+        Ok(Queue { reactor: Mutex::new(None), fd: self.fd.try_clone()?, watches })
     }
 
     pub fn raw_fd(&self) -> RawFd {
@@ -149,40 +180,47 @@ impl Queue {
         if let Some(reactor) = &*slot {
             return Ok(reactor.clone());
         }
-        let reactor = Arc::new(Reactor::new(self.fd.as_raw_fd(), self.writable)?);
+        let reactor = Arc::new(Reactor::new(self.fd.as_raw_fd(), self.watches)?);
         *slot = Some(reactor.clone());
         Ok(reactor)
     }
 }
 
-/// One end of a queue: its descriptor and how that end waits for it.
+/// One end of a queue: its descriptor and how that end waits for it. The fields that hold the
+/// reactor come before the queue, which may be this end's alone: the reactor lets go of the
+/// descriptor before the descriptor is closed.
 pub(crate) struct Port {
-    queue: Arc<Queue>,
-    /// The writing end.
-    write: bool,
-    /// The queue's reactor, looked up when the end first waits asynchronously.
-    reactor: Option<Arc<Reactor>>,
     /// Resolves when the interface is deleted: the queue then reports only an error condition,
     /// which Tokio's readability does not cover.
     #[cfg(all(feature = "tokio", any(target_os = "linux", target_os = "android")))]
     gone: Option<std::pin::Pin<Box<dyn Future<Output = ()> + Send>>>,
+    /// The queue's reactor, looked up when the end first waits asynchronously.
+    reactor: Option<Arc<Reactor>>,
+    /// The writing end.
+    write: bool,
     /// The queue reported the error condition. The kernel reports it a moment before reads
     /// fail, and nothing after: from then on every wait is over at once, until a read fails.
     #[cfg(all(feature = "tokio", any(target_os = "linux", target_os = "android")))]
     going: bool,
+    queue: Arc<Queue>,
 }
 
 impl Port {
     pub fn new(queue: Arc<Queue>, write: bool) -> Port {
         Port {
-            queue,
-            write,
-            reactor: None,
             #[cfg(all(feature = "tokio", any(target_os = "linux", target_os = "android")))]
             gone: None,
+            reactor: None,
+            write,
             #[cfg(all(feature = "tokio", any(target_os = "linux", target_os = "android")))]
             going: false,
+            queue,
         }
+    }
+
+    /// One more writing end of the same queue, behind a descriptor of its own.
+    pub fn for_writer(&self) -> io::Result<Port> {
+        Ok(Port::new(Arc::new(self.queue.for_writer()?), true))
     }
 
     pub fn fd(&self) -> RawFd {
@@ -441,6 +479,41 @@ mod tests {
         signal.reset().unwrap();
         let error = wait(read.as_raw_fd(), libc::POLLIN, Some(&signal), soon).unwrap_err();
         assert_eq!(error.kind(), ErrorKind::TimedOut, "a reset interrupt lets waits go on");
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn the_writers_of_a_queue_each_wait_for_room() {
+        use std::io::Read;
+        let (ours, mut theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        ours.set_nonblocking(true).unwrap();
+        let first = Port::new(Arc::new(Queue::new(OwnedFd::from(ours))), true);
+        let second = first.for_writer().unwrap();
+        assert_ne!(first.fd(), second.fd(), "one more writer has a descriptor of its own");
+        let chunk = [0u8; 4096];
+        let mut written = 0;
+        loop {
+            // SAFETY: `chunk` is readable for its length.
+            let wrote = unsafe { libc::write(second.fd(), chunk.as_ptr().cast(), chunk.len()) };
+            if wrote < 0 {
+                assert_eq!(io::Error::last_os_error().kind(), ErrorKind::WouldBlock);
+                break;
+            }
+            written += wrote as usize;
+        }
+        let waits = [first, second].map(|mut port| {
+            tokio::spawn(async move {
+                std::future::poll_fn(|cx| port.poll_ready(cx)).await.unwrap();
+                port
+            })
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(waits.iter().all(|wait| !wait.is_finished()), "neither writer has room while the queue is full");
+        let mut taken = vec![0u8; written];
+        theirs.read_exact(&mut taken).unwrap();
+        for wait in waits {
+            tokio::time::timeout(std::time::Duration::from_secs(5), wait).await.expect("each writer is woken once there is room").unwrap();
+        }
     }
 
     #[test]

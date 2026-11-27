@@ -130,6 +130,12 @@ pub trait Sink: Wait + Send {
     /// more. Returns how many it took. A write the device refuses on its own counts as taken,
     /// and as dropped; an error means the device is gone.
     fn write(&mut self, list: &impl Writes, stats: &mut WriterStats) -> io::Result<usize>;
+
+    /// One more writing end of the same queue, which writes and waits on its own: both ends
+    /// may be used by different threads at the same time.
+    fn try_clone(&self) -> io::Result<Self>
+    where
+        Self: Sized;
 }
 
 /// Keeps a reader whose queue never runs empty from holding its thread for good: tasks woken
@@ -296,7 +302,7 @@ impl fmt::Debug for Interrupt {
 
 /// One queue of a device, with both of its ends. A device hands out each of its queues once,
 /// when it is built, and a queue is split into its two ends once, so there is never more than
-/// one reader and one writer of a queue.
+/// one reader of a queue. More writers of it come from [`Writer::try_clone`].
 pub struct Queue<L: Layer = Ip> {
     pub(crate) tunnel: Arc<L::Tunnel>,
     pub(crate) index: usize,
@@ -371,6 +377,9 @@ pub struct Reader<L: Layer = Ip> {
 /// it is given to the device; what the device cannot take yet is copied and written before
 /// anything that comes later, so a call that returns has taken every packet, and cancelling a
 /// wait never loses or repeats one.
+///
+/// A queue takes packets from several threads at once: [`Writer::try_clone`] gives each of
+/// them a writer of its own.
 pub struct Writer<L: Layer = Ip> {
     sink: <L::Tunnel as Tunnel>::Sink,
     plan: Plan,
@@ -776,6 +785,25 @@ impl<L: Layer> Writer<L> {
     /// What the writer has done so far.
     pub fn stats(&self) -> WriterStats {
         self.stats
+    }
+
+    /// One more writer of the same queue, for another task or thread to write at the same
+    /// time. It has the interrupt and the timeout of this one, counts what it does on its own,
+    /// and keeps on its own what the device does not take from it at once.
+    ///
+    /// Each writer hands the device its packets in the order it was given them. Between two
+    /// writers there is no order: a flow whose packets have to arrive in order goes through
+    /// one writer at a time, and moves to another only once [`Writer::writable`] has said that
+    /// the device took everything the first was given.
+    pub fn try_clone(&self) -> io::Result<Writer<L>> {
+        Ok(Writer {
+            sink: self.sink.try_clone()?,
+            plan: Plan::new(),
+            backlog: Backlog::default(),
+            full: false,
+            blocking: self.blocking.clone(),
+            stats: WriterStats::default(),
+        })
     }
 
     /// Writes what the device takes now and keeps the rest. Nothing waits from before.

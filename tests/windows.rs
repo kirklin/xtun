@@ -13,7 +13,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use common::{Build, Counters, Mode, NEIGHBOR_MAC, Nat, ethernet, ip_packet, reflect, stop, transfer};
+use common::{Build, Counters, Mode, NEIGHBOR_MAC, Nat, ethernet, ip_packet, reflect, several_writers, stop, transfer};
 use xtun::{Builder, Checksum, Ethernet, Ip, Packet, Queue, Reader, Tap, Tun, Writer};
 use ipnet::IpNet;
 use tokio::net::UdpSocket;
@@ -283,6 +283,29 @@ async fn tap_udp_round_trip() {
     neighbors(&device, &["10.174.0.2", "fd74::2"]);
     let (mut reader, mut writer) = ends(queues);
     udp_round_trip(&mut reader, &mut writer, [("10.174.0.1", "10.174.0.2"), ("fd74::1", "fd74::2")], 14).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "creates adapters: run with scripts/vm/windows.ts"]
+async fn wintun_takes_packets_from_several_writers() {
+    let (_device, queues) = tun("xtuntest11").address(net("10.190.0.1/24")).build().unwrap();
+    let (_reader, writer) = ends(queues);
+    let socket = std::net::UdpSocket::bind("10.190.0.1:0").unwrap();
+    let port = socket.local_addr().unwrap().port();
+    let from = Build { src: ip("10.190.0.2"), dst: ip("10.190.0.1"), src_port: 9, dst_port: port, ttl: 64, id: 3 };
+    several_writers(writer, socket, move |payload| from.udp(payload)).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "creates adapters: run with scripts/vm/windows.ts"]
+async fn tap_takes_frames_from_several_writers() {
+    let (device, queues) = tap("xtuntap4").address(net("10.191.0.1/24")).build().unwrap();
+    assert_eq!(device.mac_address().unwrap(), DEVICE_MAC);
+    let (_reader, writer) = ends(queues);
+    let socket = std::net::UdpSocket::bind("10.191.0.1:0").unwrap();
+    let port = socket.local_addr().unwrap().port();
+    let from = Build { src: ip("10.191.0.2"), dst: ip("10.191.0.1"), src_port: 9, dst_port: port, ttl: 64, id: 3 };
+    several_writers(writer, socket, move |payload| ethernet(DEVICE_MAC, NEIGHBOR_MAC, &from.udp(payload))).await;
 }
 
 /// Moves data both ways over two connections through a reflector on the device.
