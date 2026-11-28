@@ -302,7 +302,11 @@ impl Write for BpfWrites {
     fn write(&mut self, fd: RawFd, list: &impl List, stats: &mut WriterStats) -> Result<usize> {
         for index in 0..list.count() {
             self.iov.clear();
-            self.iov.gather(list, index);
+            if self.iov.gather(list, index) == 0 {
+                // An empty write goes nowhere: the device refuses it.
+                stats.dropped += 1;
+                continue;
+            }
             stats.calls += 1;
             // SAFETY: the pointers refer to pieces that `list` lends for this call.
             let result = retry(|| unsafe { libc::writev(fd, self.iov.as_ptr(), self.iov.len() as libc::c_int) });
@@ -534,5 +538,20 @@ mod tests {
             assert_eq!(bytes, &frame[..]);
         }
         drop(reads);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_write_without_pieces_to_a_bpf_device_is_dropped_without_a_call() {
+        let (near, far) = pair();
+        let list = Pieces(vec![vec![], vec![vec![0xaa; 14], vec![0xbb; 46]], vec![]]);
+        let mut stats = WriterStats::default();
+        assert_eq!(BpfWrites::default().write(near.as_raw_fd(), &list, &mut stats).unwrap(), 3);
+        assert_eq!((stats.writes, stats.dropped, stats.calls), (1, 2, 1));
+        let mut frame = [0u8; 64];
+        // SAFETY: `frame` is writable for its length.
+        let read = unsafe { libc::recv(far.as_raw_fd(), frame.as_mut_ptr().cast(), frame.len(), libc::MSG_DONTWAIT) };
+        assert_eq!(read, 60);
+        assert_eq!(frame[..60], [[0xaa; 14].as_slice(), [0xbb; 46].as_slice()].concat());
     }
 }
