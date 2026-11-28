@@ -424,6 +424,17 @@ fn create_interface(name: &str) -> Result<()> {
     ioctl(libc::AF_INET, os::SIOCIFCREATE, &mut request)
 }
 
+/// Makes the interface called `name` and opens its device node. The interface goes again if the
+/// node does not open, as it does where `/dev` has no node of its unit.
+#[cfg(any(target_os = "netbsd", target_os = "openbsd"))]
+fn create_and_open(name: &str) -> Result<OwnedFd> {
+    create_interface(name)?;
+    open_device(name).inspect_err(|_| {
+        // The failure to open is the one to report; the interface stays behind if it does not go.
+        let _ = destroy_interface(name);
+    })
+}
+
 fn destroy_interface(name: &str) -> Result<()> {
     let mut request = request(name)?;
     ioctl(libc::AF_INET, os::SIOCIFDESTROY, &mut request)
@@ -492,10 +503,7 @@ fn open(ethernet: bool, name: Option<&str>, reuse: bool, persist: bool) -> Resul
         (_, Some(name)) => {
             let existed = claim(ethernet, name, reuse)?;
             // Opening a tun device makes its interface; a tap device's has to be made first.
-            if ethernet && !existed {
-                create_interface(name)?;
-            }
-            let fd = open_device(name)?;
+            let fd = if ethernet && !existed { create_and_open(name)? } else { open_device(name)? };
             // One that is to persist does once it is set up.
             let removal = Removal::Explicit { persist: AtomicBool::new(existed) };
             Ok(Opened { fd, name: name.to_owned(), removal })
@@ -503,8 +511,7 @@ fn open(ethernet: bool, name: Option<&str>, reuse: bool, persist: bool) -> Resul
         // A tap device node opens an interface that exists: a persistent one is made first.
         (true, None) => {
             let name = (0..).map(|unit| format!("{}{unit}", os::TAP_PREFIX)).find(|name| !exists(name)).expect("a free unit");
-            create_interface(&name)?;
-            let fd = open_device(&name)?;
+            let fd = create_and_open(&name)?;
             Ok(Opened { fd, name, removal: Removal::Explicit { persist: AtomicBool::new(false) } })
         }
         (false, None) => {
@@ -531,10 +538,7 @@ fn open(ethernet: bool, name: Option<&str>, reuse: bool, persist: bool) -> Resul
     };
     let existed = claim(ethernet, &name, reuse)?;
     // An interface made before its device is opened stays when the device is closed.
-    if persist && !existed {
-        create_interface(&name)?;
-    }
-    let fd = open_device(&name)?;
+    let fd = if persist && !existed { create_and_open(&name)? } else { open_device(&name)? };
     // One made to persist does once it is set up.
     let removal = match (existed, persist) {
         (true, _) => Removal::Explicit { persist: AtomicBool::new(true) },
