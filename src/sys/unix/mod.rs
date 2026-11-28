@@ -310,9 +310,7 @@ impl Signal {
             None => (self.read.as_raw_fd(), &one[..]),
         };
         // SAFETY: `bytes` is readable for its length.
-        if unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        transport::retry(|| unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) })?;
         self.set.store(true, Ordering::Release);
         Ok(())
     }
