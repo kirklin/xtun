@@ -64,7 +64,8 @@ pub fn rewrite(packet: &mut [u8], partial: bool, nat: &Nat) -> bool {
     } else if protocol == 17 && !v6 && value == 0 {
         0
     } else {
-        !Sum::ZERO.word(!value).word(!old.fold()).combine(new).fold()
+        let sum = Sum::ZERO.word(!value).word(!old.fold()).combine(new);
+        if protocol == 17 { sum.udp_checksum() } else { sum.checksum() }
     };
     packet[at..at + 2].copy_from_slice(&updated.to_be_bytes());
     true

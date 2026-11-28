@@ -11,7 +11,7 @@ use std::ops::Range;
 use crate::checksum::Sum;
 use crate::packet::{
     CWR, Checksum, FIN, Gso, GsoKind, Head, PSH, Packet, Parts, TCP_CHECKSUM, UDP_CHECKSUM, adjust_partial, complete, each_in,
-    invalid, ipv4_header_checksum, link_len, read_u16, sum_in, write_u16,
+    field_value, invalid, ipv4_header_checksum, link_len, read_u16, sum_in, write_u16,
 };
 
 /// The longest headers a segment can repeat: IPv6 with extension headers and TCP options.
@@ -183,8 +183,8 @@ impl Cut {
         each_in(whole, 0..self.header_len, |bytes| out.extend_from_slice(bytes));
         let header = &mut out[at..];
         self.patch(header, index, payload.len());
-        let value = sum_in(whole, payload.clone(), Sum::ZERO.bytes(&header[self.transport..])).checksum();
-        write_u16(header, self.checksum_at, value);
+        let sum = sum_in(whole, payload.clone(), Sum::ZERO.bytes(&header[self.transport..]));
+        write_u16(header, self.checksum_at, field_value(sum, self.checksum_at - self.transport));
         payload
     }
 }
@@ -197,7 +197,7 @@ pub(crate) fn complete_into(packet: &impl Parts, total: usize, start: usize, off
     let at = out.len();
     each_in(packet, 0..split, |bytes| out.extend_from_slice(bytes));
     let header = &mut out[at..];
-    let value = sum_in(packet, split..total, Sum::ZERO.bytes(&header[start..])).checksum();
+    let value = field_value(sum_in(packet, split..total, Sum::ZERO.bytes(&header[start..])), offset);
     write_u16(header, start + offset, value);
     split..total
 }

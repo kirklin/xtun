@@ -145,7 +145,8 @@ impl Build {
             (IpAddr::V6(s), IpAddr::V6(d)) => pseudo_v6(&s.octets(), &d.octets(), protocol, length as u32),
             _ => unreachable!(),
         };
-        let value = pseudo.bytes(&packet[start..]).checksum();
+        let sum = pseudo.bytes(&packet[start..]);
+        let value = if protocol == 17 { sum.udp_checksum() } else { sum.checksum() };
         packet[start + field..start + field + 2].copy_from_slice(&value.to_be_bytes());
         packet
     }
@@ -282,7 +283,10 @@ pub fn rewrite(frame: &mut [u8], checksum: Checksum, nat: &Nat) -> bool {
         // The field holds the pseudo header sum: move it from the old addresses to the new.
         Checksum::Partial { .. } => Sum::ZERO.word(value).word(!old.fold()).combine(new).fold(),
         _ if protocol == 17 && !v6 && value == 0 => 0,
-        _ => !Sum::ZERO.word(!value).word(!old.fold()).combine(new).fold(),
+        _ => {
+            let sum = Sum::ZERO.word(!value).word(!old.fold()).combine(new);
+            if protocol == 17 { sum.udp_checksum() } else { sum.checksum() }
+        }
     };
     packet[at..at + 2].copy_from_slice(&updated.to_be_bytes());
     true

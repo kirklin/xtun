@@ -83,7 +83,8 @@ fn build(flow: &Flow, flags: u8, payload: &[u8]) -> Vec<u8> {
         pseudo_v4(&p[12..16], &p[16..20], protocol, transport as u16)
     };
     let field = start + if flow.tcp { 16 } else { 6 };
-    let value = pseudo.bytes(&p[start..]).checksum();
+    let sum = pseudo.bytes(&p[start..]);
+    let value = if flow.tcp { sum.checksum() } else { sum.udp_checksum() };
     p[field..field + 2].copy_from_slice(&value.to_be_bytes());
     p
 }

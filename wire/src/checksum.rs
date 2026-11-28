@@ -49,12 +49,19 @@ impl Sum {
         u16::from_be(fold64(self.acc))
     }
 
-    /// The value for a checksum field: the complement of the folded sum. A result of zero is
-    /// written as `0xffff`, which is the same number in one's complement and keeps UDP from
-    /// reading it as "no checksum".
+    /// The value for a checksum field: the complement of the folded sum. The sum of a header is
+    /// never zero, so the field is never `0xffff` (RFC 1624, section 3).
     #[inline]
     pub fn checksum(self) -> u16 {
-        match !self.fold() {
+        !self.fold()
+    }
+
+    /// The value for a UDP checksum field: as [`Sum::checksum`], with a result of zero written as
+    /// `0xffff`, the same number in one's complement, since a zero field says that a datagram
+    /// has no checksum (RFC 768).
+    #[inline]
+    pub fn udp_checksum(self) -> u16 {
+        match self.checksum() {
             0 => 0xffff,
             value => value,
         }
@@ -354,8 +361,15 @@ mod tests {
         assert_eq!(Sum::ZERO.fold(), 0);
         assert_eq!(Sum::ZERO.checksum(), 0xffff);
         assert_eq!(Sum::ZERO.bytes(&[0xff, 0xff]).fold(), 0xffff);
-        assert_eq!(Sum::ZERO.bytes(&[0xff, 0xff]).checksum(), 0xffff);
         assert_eq!(Sum::ZERO.word(0x1234).word(!0x1234).fold(), 0xffff);
+    }
+
+    #[test]
+    fn only_udp_writes_a_zero_checksum_as_ffff() {
+        let all_ones = Sum::ZERO.word(0x1234).word(!0x1234);
+        assert_eq!((all_ones.checksum(), all_ones.udp_checksum()), (0, 0xffff));
+        let other = Sum::ZERO.bytes(&[0x12, 0x34]);
+        assert_eq!((other.checksum(), other.udp_checksum()), (!0x1234, !0x1234));
     }
 
     #[test]

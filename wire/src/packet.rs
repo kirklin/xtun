@@ -405,9 +405,15 @@ pub(crate) fn adjust_partial(field: u16, old: usize, new: usize) -> u16 {
     Sum::ZERO.word(field).word(!(old as u16)).word(new as u16).fold()
 }
 
+/// The value of the checksum field at `offset` in a transport header, whose summed range comes
+/// to `sum`: only UDP's field is at 6 among the protocols whose checksums are completed.
+pub(crate) fn field_value(sum: Sum, offset: usize) -> u16 {
+    if offset == UDP_CHECKSUM { sum.udp_checksum() } else { sum.checksum() }
+}
+
 /// Finishes a partial checksum: adds the bytes from `start` on, the field included.
 pub(crate) fn complete(p: &mut [u8], start: usize, offset: usize) {
-    let value = Sum::ZERO.bytes(&p[start..]).checksum();
+    let value = field_value(Sum::ZERO.bytes(&p[start..]), offset);
     p[start + offset..start + offset + 2].copy_from_slice(&value.to_be_bytes());
 }
 
@@ -510,7 +516,7 @@ pub(crate) mod build {
             p[ip_len + transport..].copy_from_slice(payload);
             let info = Transport::read(&p, 0).expect("a well formed packet");
             let offset = info.checksum_offset();
-            let value = info.pseudo(&p, total - ip_len).bytes(&p[ip_len..]).checksum();
+            let value = field_value(info.pseudo(&p, total - ip_len).bytes(&p[ip_len..]), offset);
             write_u16(&mut p, ip_len + offset, value);
             p
         }
@@ -579,6 +585,16 @@ mod tests {
         let mut unsummed = Flow::udp(false).packet(1, &payload(1, 64));
         unsummed[26..28].fill(0);
         assert!(Transport::read(&unsummed, 0).unwrap().verify(&unsummed));
+    }
+
+    #[test]
+    fn an_ipv4_header_whose_sum_is_all_ones_gets_a_zero_checksum() {
+        let mut header = [0x45, 0, 0, 20, 0, 0, 0x40, 0, 64, 17, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2];
+        let id = !Sum::ZERO.bytes(&header).fold();
+        header[4..6].copy_from_slice(&id.to_be_bytes());
+        ipv4_header_checksum(&mut header);
+        assert_eq!(header[10..12], [0, 0], "a header is never all zeros, so its checksum is never 0xffff");
+        assert_eq!(Sum::ZERO.bytes(&header).fold(), 0xffff);
     }
 
     #[test]
