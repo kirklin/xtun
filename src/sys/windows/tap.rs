@@ -99,7 +99,8 @@ impl crate::sys::Tunnel for Tap {
         if name.is_empty() || name.encode_utf16().count() >= 128 {
             return Err(Error::new(ErrorKind::InvalidInput, "an adapter name has 1 to 127 characters"));
         }
-        let (adapter, luid) = if let Some(luid) = config::luid_of(&name)? {
+        let existed = config::luid_of(&name)?;
+        let (adapter, luid) = if let Some(luid) = existed {
             if !options.reuse {
                 return Err(Error::new(ErrorKind::AlreadyExists, format!("an interface is called {name}")));
             }
@@ -117,7 +118,10 @@ impl crate::sys::Tunnel for Tap {
             step("writing the TAP adapter's hardware address", set_network_address(&adapter.guid, mac))?;
             step("restarting the TAP adapter", restart(&adapter.guid))?;
         }
-        let file = open(&adapter.guid).map_err(|error| match error.kind() {
+        // The driver makes the file of an adapter that starts a moment after it started; an
+        // adapter that was there and runs has its file, or is of another kind.
+        let starting = existed.is_none() || options.mac_address.is_some();
+        let file = open(&adapter.guid, if starting { START_TIMEOUT } else { Duration::ZERO }).map_err(|error| match error.kind() {
             ErrorKind::NotFound => Error::new(ErrorKind::InvalidInput, format!("{name} is not a TAP-Windows adapter")),
             _ => error,
         })?;
@@ -268,10 +272,11 @@ fn name_new(luid: &NET_LUID_LH, name: &str) -> Result<()> {
     }
 }
 
-/// Opens the adapter's file for overlapped reads and writes, waiting for a new adapter to start.
-fn open(guid: &str) -> Result<OwnedHandle> {
+/// Opens the adapter's file for overlapped reads and writes, waiting up to `patience` for an
+/// adapter that starts.
+fn open(guid: &str, patience: Duration) -> Result<OwnedHandle> {
     let path = wide(format!(r"\\.\Global\{guid}.tap").as_ref());
-    let deadline = Instant::now() + START_TIMEOUT;
+    let deadline = Instant::now() + patience;
     loop {
         // SAFETY: the path is NUL-terminated; the handle is owned right away.
         let handle = unsafe {
