@@ -331,6 +331,9 @@ impl Interface {
         }
         let mut request = lifreq(&entry.logical)?;
         if entry.logical == self.name {
+            // illumos gives a logical interface that is up no unspecified IPv6 address: it goes
+            // down first, and comes up again with the next address it gets.
+            set_flag(family, &entry.logical, sys::IFF_UP, false)?;
             let unspecified = if family == libc::AF_INET { IpAddr::V4(Ipv4Addr::UNSPECIFIED) } else { IpAddr::V6(Ipv6Addr::UNSPECIFIED) };
             request.lifr_lifru.lifru_addr = storage(unspecified);
             ioctl(family, sys::SIOCSLIFADDR, &mut request)?;
