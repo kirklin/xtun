@@ -369,9 +369,8 @@ impl Builder<Ip> {
 #[cfg(target_vendor = "apple")]
 impl Builder<Ip> {
     /// The receive buffer of the interface's socket in bytes (`SO_RCVBUF`): the room for packets
-    /// that wait for the reader. Left out, it is the largest the system allows
-    /// (`kern.ipc.maxsockbuf`) from 8 MiB down to 1 MiB; a size the system refuses fails the
-    /// build.
+    /// that wait for the reader. Left out, it is 8 MiB, or as much of that as the system allows
+    /// (`kern.ipc.maxsockbuf`); a size above what the system allows fails the build.
     pub fn receive_buffer(mut self, bytes: u32) -> Builder<Ip> {
         self.options.receive_buffer = Some(bytes);
         self
@@ -747,7 +746,8 @@ impl Device<Ip> {
     }
 
     /// Changes the receive buffer of the interface's socket. The packets queued for the reader
-    /// are limited again to what fits it.
+    /// are limited again to what fits it. A size above what the system allows
+    /// (`kern.ipc.maxsockbuf`) is refused and leaves the buffer as it was.
     pub fn set_receive_buffer(&self, bytes: u32) -> io::Result<()> {
         self.tunnel.set_receive_buffer(bytes)
     }

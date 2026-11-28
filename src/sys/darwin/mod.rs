@@ -211,7 +211,7 @@ impl Tun {
     }
 
     /// Sets the receive buffer of the socket, and limits the packets queued for the reader to
-    /// what fits it.
+    /// what fits it. A size above what the system allows is refused.
     pub fn set_receive_buffer(&self, bytes: u32) -> Result<()> {
         let size = positive(bytes, "the receive buffer in bytes")?;
         let mut tuning = self.tuning.lock().unwrap_or_else(PoisonError::into_inner);
@@ -346,22 +346,42 @@ fn positive(value: u32, what: &str) -> Result<libc::c_int> {
 
 /// Sets the receive buffer and lets the interface queue packets for the reader, so one
 /// `recvmsg_x` takes many. The driver queues one packet by default and pauses until it is read.
-/// A buffer that `tuning` names has to be one the system allows; without one, the largest it
-/// allows is taken.
 fn tune(fd: RawFd, mtu: usize, tuning: Tuning) -> Result<()> {
     match tuning.receive_buffer {
-        Some(size) => setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, size)?,
-        None => {
-            let mut size = RECEIVE_BUFFER;
-            while size >= RECEIVE_BUFFER_MINIMUM {
-                if setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, size).is_ok() {
-                    break;
-                }
-                size /= 2;
-            }
-        }
+        Some(size) => exact_receive_buffer(fd, size)?,
+        None => large_receive_buffer(fd, RECEIVE_BUFFER, RECEIVE_BUFFER_MINIMUM)?,
     }
     queue_pending(fd, mtu, tuning.max_pending_packets.unwrap_or(MAX_PENDING_PACKETS))
+}
+
+/// Gives the socket a receive buffer of `size` bytes. The system cuts a size above its limit,
+/// `kern.ipc.maxsockbuf`, down to the limit without a word: such a size is refused here, and the
+/// socket keeps the buffer it had.
+fn exact_receive_buffer(fd: RawFd, size: libc::c_int) -> Result<()> {
+    let before = getsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF)?;
+    setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, size)
+        .map_err(|error| Error::new(error.kind(), format!("a receive buffer of {size} bytes: {error}")))?;
+    let given = getsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF)?;
+    if given != size {
+        setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, before)?;
+        return Err(Error::new(ErrorKind::InvalidInput, format!("the system gives a receive buffer of {given} bytes at most")));
+    }
+    Ok(())
+}
+
+/// Gives the socket the largest receive buffer the system allows, from `most` bytes down to
+/// `least`. The system cuts a size above its limit down to the limit, and refuses it for a
+/// socket that is at the limit already: a socket keeps a buffer that is larger than the next
+/// size to try.
+fn large_receive_buffer(fd: RawFd, most: libc::c_int, least: libc::c_int) -> Result<()> {
+    let mut size = most;
+    while size >= least && getsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF)? < size {
+        if setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, size).is_ok() {
+            break;
+        }
+        size /= 2;
+    }
+    Ok(())
 }
 
 /// Lets the interface queue up to `most` packets for the reader, and no more than fit the
@@ -425,6 +445,32 @@ mod tests {
         ] {
             assert_eq!(refused.build().unwrap_err().kind(), ErrorKind::InvalidInput);
         }
+    }
+
+    /// The receive buffer of a datagram socket of the system's own.
+    fn buffer_of(socket: &std::os::unix::net::UnixDatagram) -> libc::c_int {
+        getsockopt(socket.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF).unwrap()
+    }
+
+    #[test]
+    fn a_receive_buffer_above_the_limit_of_the_system_is_refused_and_leaves_the_one_before() {
+        let (socket, _other) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        exact_receive_buffer(socket.as_raw_fd(), 256 << 10).unwrap();
+        assert_eq!(buffer_of(&socket), 256 << 10);
+        assert!(exact_receive_buffer(socket.as_raw_fd(), libc::c_int::MAX).is_err());
+        assert_eq!(buffer_of(&socket), 256 << 10);
+    }
+
+    /// The system refuses a size above its limit for a socket that is at the limit, and takes
+    /// a smaller one: a socket that got the largest buffer keeps it when it is tuned again.
+    #[test]
+    fn a_socket_keeps_the_largest_receive_buffer_when_it_is_tuned_again() {
+        let (socket, _other) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        large_receive_buffer(socket.as_raw_fd(), libc::c_int::MAX, 1).unwrap();
+        let largest = buffer_of(&socket);
+        assert!(largest > 4096, "the buffer grew: {largest}");
+        large_receive_buffer(socket.as_raw_fd(), libc::c_int::MAX, 1).unwrap();
+        assert_eq!(buffer_of(&socket), largest);
     }
 
     #[test]

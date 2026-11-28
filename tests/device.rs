@@ -816,12 +816,14 @@ fn receive_buffer_and_pending_packets() {
     assert_eq!(tuned(&device), (256 << 10, 152));
     device.set_receive_buffer(4 << 20).unwrap();
     assert_eq!(tuned(&device), (4 << 20, 1000));
-    // What the system could not take is refused and changes nothing.
+    // What the system could not take is refused and changes nothing: the system would cut a
+    // buffer above its limit down to the limit.
     assert_eq!(device.set_max_pending_packets(0).unwrap_err().kind(), io::ErrorKind::InvalidInput);
     assert_eq!(device.set_receive_buffer(0).unwrap_err().kind(), io::ErrorKind::InvalidInput);
-    assert!(device.set_receive_buffer(1 << 30).is_err(), "a buffer above the system's limit");
+    let above = i32::MAX as u32;
+    assert!(device.set_receive_buffer(above).is_err(), "a buffer above the system's limit");
     assert_eq!(tuned(&device), (4 << 20, 1000));
-    assert!(builder("xtuntest24").receive_buffer(1 << 30).build().is_err(), "a buffer above the system's limit");
+    assert!(builder("xtuntest24").receive_buffer(above).build().is_err(), "a buffer above the system's limit");
 }
 
 #[test]
