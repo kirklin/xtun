@@ -374,11 +374,11 @@ impl Plan {
         }
         if info.tcp {
             let t = info.transport;
-            // Everything after the sequence number must match except PSH: acknowledgement, header
-            // length, flags, window and options.
+            // Everything after the sequence number must match except PSH and the checksum:
+            // acknowledgement, header length, flags, window, urgent pointer and options.
             let same_tcp = first[t + 8..t + 13] == data[t + 8..t + 13]
                 && first[t + 14..t + 16] == data[t + 14..t + 16]
-                && first[t + 20..info.header_len] == data[t + 20..info.header_len];
+                && first[t + 18..info.header_len] == data[t + 18..info.header_len];
             if !same_tcp || candidate.seq != run.next_seq {
                 return false;
             }
@@ -930,6 +930,22 @@ mod tests {
         let plan = planned(&virtio(true, false), &views);
         assert_eq!(Header::read(&write(&plan, &views, 2)), Header::default());
         assert_eq!(write(&plan, &views, 2)[vnet::LEN..], packets[2], "the wrong header checksum stays for the system to find");
+    }
+
+    /// A cut copies the urgent pointer of the first packet to all, so packets with another one do
+    /// not join it.
+    #[test]
+    fn tcp_packets_with_another_urgent_pointer_are_not_joined() {
+        for v6 in [false, true] {
+            let mut packets = tcp_run(&mut Flow::tcp(v6), 7, &[1000; 3], 1);
+            let t = if v6 { 40 } else { 20 };
+            packets[1][t + 18..t + 20].copy_from_slice(&5u16.to_be_bytes());
+            let views: Vec<Packet<'_>> = packets.iter().map(|p| Packet::new(p).with_checksum(Checksum::Valid)).collect();
+            let plan = planned(&virtio(true, false), &views);
+            assert_eq!(counts(&plan), [1, 1, 1], "v6 {v6}");
+            let out = written(&plan, &views);
+            assert_eq!(out[1][t + 18..t + 20], packets[1][t + 18..t + 20], "v6 {v6}");
+        }
     }
 
     /// A segment that is cut again numbers its IPv4 packets one after the other from the first:
