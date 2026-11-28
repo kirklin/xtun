@@ -182,14 +182,14 @@ impl super::Descriptors for Tunnel {
 
 impl super::Adopt for Tunnel {
     fn adopt(fd: OwnedFd, ethernet: bool) -> Result<Tunnel> {
-        set_nonblocking(fd.as_raw_fd())?;
         let (name, flags) = match get_iff(fd.as_raw_fd()) {
             Ok(found) => found,
             // An application on Android or OpenHarmony may not be allowed to ask; the system's
             // VPN interface is a TUN interface without packet information or virtio header.
-            Err(_) if cfg!(any(target_os = "android", target_env = "ohos")) => (String::new(), libc::IFF_TUN | libc::IFF_NO_PI),
+            Err(error) if refused_to_application(&error) => (String::new(), libc::IFF_TUN | libc::IFF_NO_PI),
             Err(error) => return Err(error),
         };
+        set_nonblocking(fd.as_raw_fd())?;
         if (flags & libc::IFF_TAP != 0) != ethernet {
             let (is, wanted) = if ethernet { ("TUN", "TAP") } else { ("TAP", "TUN") };
             return Err(Error::new(ErrorKind::InvalidInput, format!("the descriptor is of a {is} interface, not of a {wanted} interface")));
@@ -199,8 +199,19 @@ impl super::Adopt for Tunnel {
         } else {
             (0, Offload::default())
         };
+        // The interface is known by its name where it lives: one of the same name in another
+        // network namespace is another interface.
+        let index = if name.is_empty() || !lives_here(fd.as_raw_fd())? {
+            0
+        } else {
+            match index_of(&name) {
+                Ok(index) => index,
+                Err(error) if refused_to_application(&error) => 0,
+                Err(error) => return Err(error),
+            }
+        };
         Ok(Tunnel {
-            interface: Interface::new(if name.is_empty() { 0 } else { index_of(&name)? }),
+            interface: Interface::new(index),
             ethernet,
             flags: flags & !libc::IFF_PERSIST,
             queues: RwLock::new(vec![Arc::new(Queue::new(fd))]),
@@ -285,6 +296,41 @@ fn attach(name: Option<&str>, flags: libc::c_int) -> Result<(OwnedFd, String)> {
         return Err(Error::new(error.kind(), format!("{what}: {error}")));
     }
     Ok((fd, read_name(&request.ifr_name)))
+}
+
+/// Whether `error` is the system refusing an application on Android or OpenHarmony what it lets
+/// only itself do.
+fn refused_to_application(error: &Error) -> bool {
+    cfg!(any(target_os = "android", target_env = "ohos")) && matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM))
+}
+
+/// `TUNGETDEVNETNS`, Linux 5.2: a descriptor of the network namespace the interface lives in.
+const TUNGETDEVNETNS: libc::Ioctl = 0x54e3;
+
+/// Whether the interface of the queue `fd` lives in the network namespace of this thread. A
+/// kernel before 5.2, and one that does not tell a process without the privilege, leaves the
+/// interface where it is looked for.
+fn lives_here(fd: RawFd) -> Result<bool> {
+    // SAFETY: TUNGETDEVNETNS takes no argument and returns a new descriptor.
+    let namespace = unsafe { libc::ioctl(fd, TUNGETDEVNETNS) };
+    if namespace < 0 {
+        let error = Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ENOTTY | libc::EINVAL | libc::EPERM | libc::EACCES) => Ok(true),
+            _ => Err(error),
+        };
+    }
+    // SAFETY: `namespace` is new and owned by nobody else.
+    let namespace = unsafe { OwnedFd::from_raw_fd(namespace) };
+    let here = std::fs::metadata("/proc/thread-self/ns/net")?;
+    // SAFETY: plain old data, which fstat fills in.
+    let mut theirs: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `theirs` is writable.
+    if unsafe { libc::fstat(namespace.as_raw_fd(), &mut theirs) } < 0 {
+        return Err(Error::last_os_error());
+    }
+    use std::os::unix::fs::MetadataExt;
+    Ok((theirs.st_dev as u64, theirs.st_ino as u64) == (here.dev(), here.ino()))
 }
 
 fn get_iff(fd: RawFd) -> Result<(String, libc::c_int)> {

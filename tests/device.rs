@@ -528,6 +528,26 @@ async fn adopts_a_descriptor() {
     }
 }
 
+/// A descriptor whose interface lives in another network namespace is adopted without its
+/// interface, which an interface of the same name here does not stand for.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "creates interfaces: run as root with --ignored"]
+fn adopts_a_descriptor_of_another_namespace() {
+    let (device, mut queues) = builder("xtuntest23").build().unwrap();
+    let fd = device.into_fd(queues.remove(0)).unwrap();
+    // This thread and what it starts move to a namespace of their own.
+    // SAFETY: changes the namespace of this thread alone.
+    assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNET) }, 0);
+    run("ip", &["link", "add", "xtuntest23", "type", "dummy"]);
+    let (adopted, queue) = Tun::from_fd(fd).unwrap();
+    let refused = adopted.name().unwrap_err();
+    assert_eq!(refused.kind(), io::ErrorKind::Unsupported, "{refused}");
+    assert!(adopted.set_mtu(1300).is_err());
+    assert!(run("ip", &["link", "show", "xtuntest23"]).contains("mtu 1500"), "the interface here is left alone");
+    drop((adopted, queue));
+}
+
 /// Runs a system tool and returns what it printed; it has to succeed.
 fn run(program: &str, args: &[&str]) -> String {
     let output = std::process::Command::new(program).args(args).output().unwrap();

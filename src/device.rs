@@ -647,7 +647,9 @@ where
     /// Wraps an interface that something else created, such as the descriptor Android's
     /// `VpnService` or iOS's packet tunnel hands to an application, and hands it over with its
     /// one queue. Fails for a descriptor of the other kind of interface. On Linux a descriptor
-    /// with `IFF_VNET_HDR` gets the offloads this library asks for. On OpenBSD a descriptor with
+    /// with `IFF_VNET_HDR` gets the offloads this library asks for, and one whose interface lives
+    /// in another network namespace is adopted without its interface: its queue reads and writes,
+    /// and the interface is configured where it lives. On OpenBSD a descriptor with
     /// `tun_hdr` keeps the offloads it has. On the BSDs and Apple systems packets come without
     /// the address family in front.
     pub fn from_fd(fd: std::os::fd::OwnedFd) -> io::Result<(Device<L>, Queue<L>)> {
