@@ -17,6 +17,8 @@ use super::darwin::sys as os;
 use super::tuntap::os;
 #[cfg(not(target_vendor = "apple"))]
 use super::unix::read_name;
+#[cfg(target_vendor = "apple")]
+use super::unix::set_cloexec;
 use super::unix::{control_socket, copy_name, index_of};
 use crate::device::Address;
 
@@ -867,13 +869,20 @@ fn routing_message(kind: u8, index: u32, flags: libc::c_int, addresses: libc::c_
     // SAFETY: the header is plain old data of its size.
     let mut message = unsafe { std::slice::from_raw_parts((&raw const header).cast::<u8>(), header_len) }.to_vec();
     message.extend_from_slice(body);
+    // Closed on exec: the Apple systems take no flag for it when the socket is made.
+    #[cfg(not(target_vendor = "apple"))]
+    let kind = libc::SOCK_RAW | libc::SOCK_CLOEXEC;
+    #[cfg(target_vendor = "apple")]
+    let kind = libc::SOCK_RAW;
     // SAFETY: plain socket creation.
-    let fd = unsafe { libc::socket(libc::PF_ROUTE, libc::SOCK_RAW, 0) };
+    let fd = unsafe { libc::socket(libc::PF_ROUTE, kind, 0) };
     if fd < 0 {
         return Err(Error::last_os_error());
     }
     // SAFETY: `fd` is new and owned by nobody else.
     let socket = unsafe { OwnedFd::from_raw_fd(fd) };
+    #[cfg(target_vendor = "apple")]
+    set_cloexec(socket.as_raw_fd())?;
     // SAFETY: the message is readable for its whole length.
     if unsafe { libc::write(socket.as_raw_fd(), message.as_ptr().cast(), message.len()) } < 0 {
         return Err(Error::last_os_error());
