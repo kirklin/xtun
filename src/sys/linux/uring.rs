@@ -1,10 +1,16 @@
 //! Batches of reads and writes in one `io_uring_enter` each.
 //!
 //! Every request carries `RWF_NOWAIT`, so the kernel completes it inside the call: a read finds
-//! a packet or fails with `EAGAIN`, a write is taken or fails with `EAGAIN`. Nothing is left in
-//! flight, nothing runs on the kernel's worker threads, and readiness still comes from the
-//! descriptor through the reactor. Writes are linked so that they happen in order, and a failed
-//! one cancels the rest, which are then submitted again.
+//! a packet or fails with `EAGAIN`, a write is taken or fails with `EAGAIN`. Nothing runs on the
+//! kernel's worker threads, and readiness still comes from the descriptor through the reactor.
+//! Writes are linked so that they happen in order, and a failed one cancels the rest, which are
+//! then submitted again.
+//!
+//! A call may still return before every request completed, after a signal, or before the kernel
+//! took every request, when it runs short of memory: the ring is entered again until each request
+//! has its completion, so that no request is left to refer to a slot or to the pieces of a write
+//! once the call returns. A ring whose call failed is dropped with what the kernel did not take,
+//! and the next batch gets a new one.
 
 use std::io::{Error, ErrorKind, Result};
 use std::os::fd::RawFd;
@@ -48,13 +54,50 @@ fn available() -> Result<()> {
     IoUring::new(2).map(drop).map_err(|error| Error::new(error.kind(), format!("io_uring is not available: {error}")))
 }
 
-fn enter(ring: &IoUring, want: usize) -> Result<()> {
-    loop {
-        match ring.submit_and_wait(want) {
-            Ok(_) => return Ok(()),
-            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error),
+/// A ring and the size it is made with, made anew after a call that failed.
+struct Ring {
+    ring: Option<IoUring>,
+    entries: u32,
+}
+
+impl Ring {
+    fn new(entries: u32) -> Result<Ring> {
+        Ok(Ring { ring: Some(IoUring::new(entries)?), entries })
+    }
+
+    /// The ring, with an empty submission queue.
+    fn get(&mut self) -> Result<&mut IoUring> {
+        if self.ring.is_none() {
+            self.ring = Some(IoUring::new(self.entries)?);
         }
+        Ok(self.ring.as_mut().expect("the ring was just made"))
+    }
+
+    /// Submits the `pushed` requests of the submission queue and enters the ring until each of
+    /// them completed, its result in `results` at the index of its user data. A failed call drops
+    /// the ring: requests the kernel did not take go with it, before anything they refer to is
+    /// used again.
+    fn complete(&mut self, pushed: usize, results: &mut [i32]) -> Result<()> {
+        let ring = self.ring.as_mut().expect("requests are pushed to the ring that `get` made");
+        let mut completed = 0;
+        let outcome = loop {
+            if completed == pushed {
+                break Ok(());
+            }
+            match ring.submit_and_wait(pushed - completed) {
+                Ok(_) => {}
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) => break Err(error),
+            }
+            for completion in ring.completion() {
+                results[completion.user_data() as usize] = completion.result();
+                completed += 1;
+            }
+        };
+        if outcome.is_err() {
+            self.ring = None;
+        }
+        outcome
     }
 }
 
@@ -79,7 +122,7 @@ impl Read for Reads {
 }
 
 struct ReadRing {
-    ring: IoUring,
+    ring: Ring,
     frames: usize,
     /// How many frames the next batch is expected to hold: more after a batch that stopped at
     /// its limit, as many as the last one after a batch that emptied the queue.
@@ -89,7 +132,9 @@ struct ReadRing {
 
 impl ReadRing {
     fn new(frames: usize) -> Result<ReadRing> {
-        Ok(ReadRing { ring: IoUring::new(frames.next_power_of_two() as u32)?, frames, want: 1, results: vec![0; frames] })
+        let entries = u32::try_from(frames.next_power_of_two())
+            .map_err(|_| Error::new(ErrorKind::InvalidInput, format!("a ring has no room for batches of {frames} frames")))?;
+        Ok(ReadRing { ring: Ring::new(entries)?, frames, want: 1, results: vec![0; frames] })
     }
 
     fn read(&mut self, fd: RawFd, slots: &mut Slots, stats: &mut ReaderStats, mut frame: impl FnMut(Found<'_>)) -> Filled {
@@ -109,8 +154,12 @@ impl ReadRing {
             return filled;
         }
         let want = (self.want - 1).min(self.frames - 1);
+        let ring = match self.ring.get() {
+            Ok(ring) => ring,
+            Err(error) => return Filled::failed(error),
+        };
         {
-            let mut queue = self.ring.submission();
+            let mut queue = ring.submission();
             for index in 0..want {
                 let room = slots.room(index + 1);
                 let entry = opcode::Read::new(types::Fd(fd), room.as_mut_ptr(), room.len() as u32)
@@ -118,16 +167,14 @@ impl ReadRing {
                     .rw_flags(libc::RWF_NOWAIT)
                     .build()
                     .user_data(index as u64);
-                // SAFETY: the slots outlive the call below, which completes every request.
+                // SAFETY: the slots outlive the call below, which completes every request or
+                // drops those the kernel did not take.
                 unsafe { queue.push(&entry).expect("the ring holds a whole batch") };
             }
         }
         stats.calls += 1;
-        if let Err(error) = enter(&self.ring, want) {
+        if let Err(error) = self.ring.complete(want, &mut self.results) {
             return Filled::failed(error);
-        }
-        for completion in self.ring.completion() {
-            self.results[completion.user_data() as usize] = completion.result();
         }
         let mut filled = Filled::more();
         let (mut read, mut bytes) = (1, first);
@@ -182,7 +229,7 @@ impl Write for Writes {
 }
 
 struct WriteRing {
-    ring: IoUring,
+    ring: Ring,
     iov: IoVecs,
     spans: Vec<(usize, usize)>,
     results: Vec<i32>,
@@ -190,7 +237,7 @@ struct WriteRing {
 
 impl WriteRing {
     fn new() -> Result<WriteRing> {
-        Ok(WriteRing { ring: IoUring::new(WRITE_ENTRIES as u32)?, iov: IoVecs::default(), spans: Vec::new(), results: vec![0; WRITE_ENTRIES] })
+        Ok(WriteRing { ring: Ring::new(WRITE_ENTRIES as u32)?, iov: IoVecs::default(), spans: Vec::new(), results: vec![0; WRITE_ENTRIES] })
     }
 
     /// Writes the list until the device is full. Returns how many writes it took.
@@ -214,7 +261,7 @@ impl WriteRing {
             let chunk = (total - next).min(WRITE_ENTRIES);
             {
                 let base = self.iov.as_ptr();
-                let mut queue = self.ring.submission();
+                let mut queue = self.ring.get()?.submission();
                 for (position, &(start, count)) in self.spans[next..next + chunk].iter().enumerate() {
                     // SAFETY: `start` is inside the list, which is not changed until the batch
                     // is written.
@@ -227,16 +274,19 @@ impl WriteRing {
                     if position + 1 < chunk {
                         entry = entry.flags(squeue::Flags::IO_LINK);
                     }
-                    // SAFETY: the pieces outlive the call below, which completes every request.
+                    // SAFETY: the pieces outlive the call below, which completes every request
+                    // or drops those the kernel did not take.
                     unsafe { queue.push(&entry).expect("the ring holds a whole chunk") };
                 }
             }
             stats.calls += 1;
-            enter(&self.ring, chunk)?;
-            for completion in self.ring.completion() {
-                self.results[completion.user_data() as usize] = completion.result();
-            }
-            for result in &self.results[..chunk] {
+            self.ring.complete(chunk, &mut self.results)?;
+            for (position, result) in self.results[..chunk].iter().enumerate() {
+                // Cancelled because the write before it was refused or cut short: it goes again
+                // with the rest.
+                if position > 0 && *result == -libc::ECANCELED {
+                    break;
+                }
                 let failed = *result < 0;
                 let result = if failed { Err(Error::from_raw_os_error(-*result)) } else { Ok(()) };
                 if let Wrote::Full = wrote(result, stats)? {
@@ -250,5 +300,58 @@ impl WriteRing {
             }
         }
         Ok(next)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::time::Duration;
+
+    use super::*;
+
+    extern "C" fn ignore(_signal: libc::c_int) {}
+
+    /// A wait that a signal ends before the request completed, as one for the writes of a chain
+    /// can end, enters the ring again until the request has its completion.
+    #[test]
+    fn every_request_has_its_completion_however_often_a_signal_comes() {
+        if kernel_version() < (6, 4) {
+            assert_eq!(available().unwrap_err().kind(), ErrorKind::Unsupported);
+            return;
+        }
+        let mut fds = [0; 2];
+        // SAFETY: `fds` holds two descriptors, which are owned right away.
+        let (read, write) = unsafe {
+            assert_eq!(libc::pipe(fds.as_mut_ptr()), 0);
+            (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1]))
+        };
+        // SAFETY: a handler that does nothing, without SA_RESTART, so that the signal ends the wait.
+        unsafe {
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = ignore as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            assert_eq!(libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()), 0);
+        }
+        let mut ring = Ring::new(4).unwrap();
+        let mut buffer = [0u8; 8];
+        // Without RWF_NOWAIT the read waits in the kernel until the pipe has a byte.
+        let entry = opcode::Read::new(types::Fd(read.as_raw_fd()), buffer.as_mut_ptr(), buffer.len() as u32).build().user_data(0);
+        // SAFETY: the buffer outlives the call below, which completes the request.
+        unsafe { ring.get().unwrap().submission().push(&entry).unwrap() };
+        // SAFETY: the thread that waits is this one, which outlives the signals.
+        let waiter = unsafe { libc::pthread_self() };
+        let signals = std::thread::spawn(move || {
+            for _ in 0..5 {
+                std::thread::sleep(Duration::from_millis(20));
+                // SAFETY: the thread exists until this thread is joined.
+                unsafe { libc::pthread_kill(waiter, libc::SIGUSR1) };
+            }
+            // SAFETY: one byte from a live buffer.
+            assert_eq!(unsafe { libc::write(write.as_raw_fd(), b"x".as_ptr().cast(), 1) }, 1);
+        });
+        let mut results = [-1; 4];
+        ring.complete(1, &mut results).unwrap();
+        signals.join().unwrap();
+        assert_eq!((results[0], buffer[0]), (1, b'x'), "the read completed with the byte");
     }
 }
