@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use ipnet::IpNet;
 use netlink_packet_core::{
-    NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL, NLM_F_REQUEST, NetlinkHeader, NetlinkMessage, NetlinkPayload,
+    NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_DUMP_INTR, NLM_F_EXCL, NLM_F_REQUEST, NetlinkHeader, NetlinkMessage, NetlinkPayload,
 };
 use netlink_packet_route::address::{AddressAttribute, AddressFlags, AddressHeaderFlags, AddressMessage, AddressScope};
 use netlink_packet_route::link::{LinkAttribute, LinkFlags, LinkMessage};
@@ -211,8 +211,21 @@ impl Netlink {
     }
 
     /// Sends one request and collects the replies until the kernel acknowledges it, reports an
-    /// error, or ends a dump.
+    /// error, or ends a dump. A dump that changes while the kernel makes it is asked for again,
+    /// so that nothing is left out of it or in it twice.
     fn request(&mut self, message: RouteNetlinkMessage, flags: u16) -> io::Result<Vec<RouteNetlinkMessage>> {
+        let dump = flags & NLM_F_DUMP == NLM_F_DUMP;
+        for _ in 0..DUMP_ATTEMPTS {
+            let (replies, interrupted) = self.exchange(message.clone(), flags)?;
+            if !(dump && interrupted) {
+                return Ok(replies);
+            }
+        }
+        Err(io::Error::new(io::ErrorKind::Interrupted, format!("the kernel's lists changed while each of {DUMP_ATTEMPTS} dumps was made")))
+    }
+
+    /// One request and its replies, and whether the kernel says that a dump changed meanwhile.
+    fn exchange(&mut self, message: RouteNetlinkMessage, flags: u16) -> io::Result<(Vec<RouteNetlinkMessage>, bool)> {
         self.seq = self.seq.wrapping_add(1);
         let seq = self.seq;
         let mut header = NetlinkHeader::default();
@@ -222,12 +235,12 @@ impl Netlink {
         request.finalize();
         let mut bytes = vec![0; request.buffer_len()];
         request.serialize(&mut bytes);
-        self.socket.send(&bytes, 0)?;
+        retry(|| self.socket.send(&bytes, 0))?;
 
         let dump = flags & NLM_F_DUMP == NLM_F_DUMP;
-        let mut replies = Vec::new();
+        let (mut replies, mut interrupted) = (Vec::new(), false);
         loop {
-            let size = self.socket.recv(&mut &mut self.buffer[..], 0)?;
+            let size = retry(|| self.socket.recv(&mut &mut self.buffer[..], 0))?;
             let mut offset = 0;
             while offset < size {
                 let reply = NetlinkMessage::<RouteNetlinkMessage>::deserialize(&self.buffer[offset..size])
@@ -240,22 +253,38 @@ impl Netlink {
                 if reply.header.sequence_number != seq {
                     continue;
                 }
+                interrupted |= reply.header.flags & NLM_F_DUMP_INTR != 0;
                 match reply.payload {
                     NetlinkPayload::Error(error) => {
                         if error.code.is_none() {
                             if !dump {
-                                return Ok(replies);
+                                return Ok((replies, interrupted));
                             }
                             continue;
                         }
                         return Err(error.to_io());
                     }
-                    NetlinkPayload::Done(_) => return Ok(replies),
+                    // A dump that failed on the way ends with the error.
+                    NetlinkPayload::Done(done) if done.code < 0 => return Err(io::Error::from_raw_os_error(-done.code)),
+                    NetlinkPayload::Done(_) => return Ok((replies, interrupted)),
                     NetlinkPayload::InnerMessage(message) => replies.push(message),
                     NetlinkPayload::Noop | NetlinkPayload::Overrun(_) => {}
                     _ => {}
                 }
             }
+        }
+    }
+}
+
+/// How often a dump is asked for while the kernel's lists keep changing as it is made.
+const DUMP_ATTEMPTS: usize = 16;
+
+/// Makes a call again while a signal interrupts it.
+fn retry<T>(mut call: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    loop {
+        match call() {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => return result,
         }
     }
 }
