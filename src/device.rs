@@ -406,8 +406,8 @@ impl<L: Layer> Builder<L> {
 
 #[cfg(windows)]
 impl Builder<Ip> {
-    /// Where `wintun.dll` is. Left out, it is looked for next to the program and in the system
-    /// directory.
+    /// Where `wintun.dll` is; a relative path is taken from the current directory. Left out, it
+    /// is looked for next to the program and in the system directory.
     pub fn wintun(mut self, path: impl Into<std::path::PathBuf>) -> Builder<Ip> {
         self.options.windows.wintun = Some(path.into());
         self

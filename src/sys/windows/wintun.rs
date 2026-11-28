@@ -9,8 +9,7 @@ use std::time::{Duration, SystemTime};
 use windows_sys::Win32::Foundation::{FreeLibrary, HANDLE};
 use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
 use windows_sys::Win32::System::LibraryLoader::{
-    GetProcAddress, LOAD_LIBRARY_SEARCH_APPLICATION_DIR, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32,
-    LoadLibraryExW,
+    GetProcAddress, LOAD_LIBRARY_SEARCH_APPLICATION_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
 };
 use windows_sys::core::{BOOL, GUID};
 
@@ -64,11 +63,13 @@ unsafe impl Send for Wintun {}
 unsafe impl Sync for Wintun {}
 
 impl Wintun {
-    /// Loads the library from `path`, or `wintun.dll` next to the program or in the system
-    /// directory. The current directory and `PATH` are never searched.
+    /// Loads the library from `path`, taken from the current directory if it is relative, or
+    /// `wintun.dll` next to the program or in the system directory. The current directory and
+    /// `PATH` are never searched, and what the library needs comes from the system directory
+    /// alone, not from the directory it lies in.
     pub fn load(path: Option<&Path>) -> Result<Wintun> {
         let (name, flags) = match path {
-            Some(path) => (wide(path.as_os_str()), LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32),
+            Some(path) => (wide(std::path::absolute(path)?.as_os_str()), LOAD_LIBRARY_SEARCH_SYSTEM32),
             None => (wide("wintun.dll".as_ref()), LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32),
         };
         // SAFETY: `name` is a NUL-terminated wide string.
