@@ -361,6 +361,10 @@ impl<L: Layer> fmt::Debug for Queue<L> {
 /// that blocks the thread and needs no runtime. The asynchronous forms run on Tokio inside a
 /// Tokio runtime and on async-io elsewhere, depending on the features enabled. Waiting can be
 /// cancelled at any point without losing a frame.
+///
+/// On Unix a Tokio runtime needs its I/O driver, which `enable_io` and `enable_all` of its
+/// builder turn on. Inside a runtime without it, Tokio panics when a reader or a writer first
+/// waits.
 pub struct Reader<L: Layer = Ip> {
     source: <L::Tunnel as Tunnel>::Source,
     /// The frames of the last read.

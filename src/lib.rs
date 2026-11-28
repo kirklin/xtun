@@ -101,4 +101,4 @@ pub use stream::{PacketSink, PacketStream};
 /// Why an asynchronous call cannot wait.
 #[cfg(all(unix, not(feature = "async-io")))]
 pub(crate) const NO_RUNTIME: &str =
-    "waiting asynchronously needs the tokio feature and a Tokio runtime, or the async-io feature";
+    "waiting asynchronously needs the tokio feature and a Tokio runtime with its I/O driver, or the async-io feature";
