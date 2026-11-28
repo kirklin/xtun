@@ -14,6 +14,8 @@ use super::sys::{msghdr_x, recvmsg_x, sendmsg_x};
 #[cfg(target_os = "macos")]
 use crate::block::Memory;
 use crate::io::{Filled, ReaderStats, WriterStats};
+#[cfg(target_os = "macos")]
+use crate::sys::unix::transport::SLOT;
 use crate::sys::unix::transport::{Found, IoVecs, Read, Slots, Write, Wrote, retry, wrote};
 
 /// Packets sent with one `sendmsg_x` at most.
@@ -226,6 +228,9 @@ pub struct BpfReads {
     buffer: Memory,
     /// The records of the last read that no batch had room for.
     held: Range<usize>,
+    /// Whether the last read took everything the device had. Once its records are handed out,
+    /// the device is known to be empty without a read that finds nothing.
+    emptied: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -236,7 +241,7 @@ impl BpfReads {
         if unsafe { libc::ioctl(fd, super::sys::BIOCGBLEN, &mut size) } < 0 {
             return Err(std::io::Error::last_os_error());
         }
-        Ok(BpfReads { buffer: Memory::new(size as usize), held: 0..0 })
+        Ok(BpfReads { buffer: Memory::new(size as usize), held: 0..0, emptied: false })
     }
 }
 
@@ -254,7 +259,13 @@ impl Read for BpfReads {
             // SAFETY: the buffer is writable for its whole length, and no frame of it is lent.
             match retry(|| unsafe { libc::read(fd, base.cast(), size) }) {
                 Ok(0) => return Filled::dry(),
-                Ok(read) => self.held = 0..read,
+                Ok(read) => {
+                    self.held = 0..read;
+                    // The device sets a buffer aside for the reader once a record no longer fits
+                    // behind the others, and keeps what comes after that in a second one. Records
+                    // that leave room for one more at its largest are all the device had.
+                    self.emptied = read + SLOT <= size;
+                }
                 Err(error) if error.kind() == ErrorKind::WouldBlock => return Filled::dry(),
                 Err(error) => return Filled::failed(error),
             }
@@ -284,7 +295,10 @@ impl Read for BpfReads {
         if self.held.len() < size_of::<bpf_hdr>() {
             self.held = 0..0;
         }
-        // The device may hold more for the next read.
+        if self.held.is_empty() && self.emptied {
+            return Filled::dry();
+        }
+        // Records are left for the next batch, or the device may hold a second buffer.
         Filled::more()
     }
 }
@@ -488,7 +502,7 @@ mod tests {
         let buffer = Memory::new(bytes.len());
         // SAFETY: the memory is new and as long as the bytes.
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.start().as_ptr(), bytes.len()) };
-        BpfReads { buffer, held: 0..bytes.len() }
+        BpfReads { buffer, held: 0..bytes.len(), emptied: false }
     }
 
     #[cfg(target_os = "macos")]
@@ -538,6 +552,49 @@ mod tests {
             assert_eq!(bytes, &frame[..]);
         }
         drop(reads);
+    }
+
+    /// What a reader of a BPF device hands out of `fd` in one batch of up to `frames` frames.
+    #[cfg(target_os = "macos")]
+    fn batch(reads: &mut BpfReads, fd: &OwnedFd, frames: usize, stats: &mut ReaderStats) -> (Vec<Vec<u8>>, Filled) {
+        let mut found = Vec::new();
+        let filled = reads.read(fd.as_raw_fd(), &mut Slots::new(0).unwrap(), frames, stats, |raw| found.push(raw.bytes.to_vec()));
+        (found, filled)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_bpf_read_that_leaves_room_for_a_record_finds_the_device_empty() {
+        let (near, far) = pair();
+        crate::sys::unix::set_nonblocking(far.as_raw_fd()).unwrap();
+        let frames: Vec<Vec<u8>> = (0..3u8).map(|number| vec![number; 60]).collect();
+        let records: Vec<u8> = frames.iter().flat_map(|frame| record(frame, frame.len())).collect();
+        let send = || {
+            // SAFETY: `records` is readable for its length.
+            assert_eq!(unsafe { libc::write(near.as_raw_fd(), records.as_ptr().cast(), records.len()) }, records.len() as isize);
+        };
+        let mut stats = ReaderStats::default();
+
+        // Room for one more record: the device is empty, which the reader says with the last
+        // record it hands out.
+        let mut reads = BpfReads { buffer: Memory::new(records.len() + SLOT), held: 0..0, emptied: false };
+        send();
+        let (first, filled) = batch(&mut reads, &far, 2, &mut stats);
+        assert!(!filled.dry && filled.error.is_none(), "a record is left for the next batch");
+        let (second, filled) = batch(&mut reads, &far, 2, &mut stats);
+        assert!(filled.dry && filled.error.is_none());
+        assert_eq!([first, second].concat(), frames);
+        assert_eq!(stats.calls, 1);
+
+        // A byte less: the device may hold a second buffer, and a read finds out.
+        let mut reads = BpfReads { buffer: Memory::new(records.len() + SLOT - 1), held: 0..0, emptied: false };
+        send();
+        let (all, filled) = batch(&mut reads, &far, 4, &mut stats);
+        assert!(!filled.dry && filled.error.is_none());
+        assert_eq!(all, frames);
+        let (none, filled) = batch(&mut reads, &far, 4, &mut stats);
+        assert!(none.is_empty() && filled.dry && filled.error.is_none());
+        assert_eq!(stats.calls, 3);
     }
 
     #[cfg(target_os = "macos")]

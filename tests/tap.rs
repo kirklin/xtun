@@ -356,6 +356,43 @@ fn a_feth_interface_that_was_there_gets_a_second_one_that_carries_its_frames() {
     assert!(!exists(name) && !exists(second), "told they may go, both interfaces go with the device");
 }
 
+/// A read that takes everything the BPF device of a `feth` pair holds tells the reader that the
+/// device is empty: it waits for the next frame without a read that finds nothing.
+#[cfg(target_os = "macos")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "creates interfaces: run as root with --ignored"]
+async fn a_feth_reader_waits_without_a_read_that_finds_nothing() {
+    const ROUNDS: u64 = 16;
+    let (device, queues) = builder("xtuntap5").address(net("10.100.0.1/24")).build().unwrap();
+    neighbors(&device, &["10.100.0.2"]);
+    let (mut reader, _writer) = ends(queues);
+    let socket = UdpSocket::bind(SocketAddr::new(ip("10.100.0.1"), 0)).await.unwrap();
+    let mut batches = 0;
+    for round in 0..ROUNDS {
+        let text = format!("frame {round} for a reader that waits");
+        // The reader waits first; the frame is sent while it does.
+        let receiving = async {
+            loop {
+                let mut batch = reader.recv().await.unwrap();
+                batches += 1;
+                if batch.frames().any(|frame| frame.data().ends_with(text.as_bytes())) {
+                    break;
+                }
+            }
+        };
+        let sending = async {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            socket.send_to(text.as_bytes(), SocketAddr::new(ip("10.100.0.2"), 9)).await.unwrap();
+        };
+        tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(receiving, sending) }).await.expect("the frame reaches the reader");
+    }
+    // A call per batch. The first read of all may find nothing, and so may one that follows a
+    // frame of the system's own that came while another was read; a reader that looked again
+    // after every batch would make a call more in every round.
+    let calls = reader.stats().calls;
+    assert!(calls <= batches + ROUNDS / 2, "{calls} calls for {batches} batches");
+}
+
 /// FreeBSD renames interfaces: a descriptor is known for what it is by its device.
 #[cfg(target_os = "freebsd")]
 #[test]
