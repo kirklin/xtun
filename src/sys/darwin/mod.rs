@@ -253,6 +253,9 @@ fn connect(unit: u32) -> Result<OwnedFd> {
     }
     // SAFETY: `fd` is new and owned by nobody else.
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    // The system makes no socket with the flag set; it is set before the socket has an interface
+    // that a program started meanwhile would keep.
+    set_cloexec(fd.as_raw_fd())?;
     let id = control_id(fd.as_raw_fd())?;
     let address = sockaddr_ctl {
         sc_len: size_of::<sockaddr_ctl>() as u8,
