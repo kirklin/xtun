@@ -49,14 +49,15 @@ impl Header {
         b[8..10].copy_from_slice(&self.csum_offset.to_ne_bytes());
     }
 
-    /// The header for a packet that is written unchanged.
+    /// The header for a packet that is written unchanged. A partial checksum's field has to end
+    /// in the first 64 KiB.
     pub fn for_packet(checksum: Checksum, gso: Option<Gso>) -> Header {
         let mut header = Header::default();
         if let Checksum::Partial { start, offset } = checksum {
             header.flags = NEEDS_CSUM;
             header.csum_start = start;
             header.csum_offset = offset;
-            header.hdr_len = start + offset + 2;
+            header.hdr_len = start.checked_add(offset).and_then(|end| end.checked_add(2)).expect("the checksum field ends in the first 64 KiB");
         }
         if let Some(gso) = gso {
             header.gso_type = match gso.kind {

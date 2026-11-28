@@ -48,8 +48,14 @@ pub struct Takes {
 
 impl Takes {
     /// Whether the device can be told what a packet leaves to it: a segment to cut or a
-    /// checksum to complete.
+    /// checksum to complete. The checksum field has to lie in the first 64 KiB, which is as far
+    /// as a virtio header reaches.
     fn carries(&self, head: Head<'_>, checksum: Checksum, gso: Option<Gso>) -> bool {
+        if let Checksum::Partial { start, offset } = checksum
+            && usize::from(start) + usize::from(offset) + 2 > usize::from(u16::MAX)
+        {
+            return false;
+        }
         match self.framing.prefix {
             Prefix::None | Prefix::Family(_) => false,
             Prefix::Virtio(_) => match gso.map(|gso| gso.kind) {
@@ -952,6 +958,22 @@ mod tests {
         let family = planned(&takes(Prefix::Family(BSD), false, false, false), &views);
         assert_eq!(write(&family, &views, 0), [&BSD.inet6.to_be_bytes()[..], &expected[0]].concat());
         assert_eq!(write(&family, &views, 4), [&BSD.inet.to_be_bytes()[..], &other].concat());
+    }
+
+    /// A virtio header tells where a checksum field is only in the first 64 KiB of a frame: one
+    /// that lies further on is completed here.
+    #[test]
+    fn a_checksum_field_past_64_kib_is_completed_here() {
+        let mut frame = payload(9, 65_600);
+        frame[12..14].fill(0);
+        frame[65_536..65_538].fill(0);
+        let views = [Packet::new(&frame).with_checksum(Checksum::Partial { start: 65_530, offset: 6 })];
+        let plan = planned(&virtio(true, true), &views);
+        let out = write(&plan, &views, 0);
+        assert_eq!(Header::read(&out[..vnet::LEN]), Header::default(), "nothing is left to the device");
+        let data = &out[vnet::LEN..];
+        assert_eq!((data.len(), &data[..65_530]), (frame.len(), &frame[..65_530]));
+        assert_eq!(crate::checksum::Sum::ZERO.bytes(&data[65_530..]).fold(), 0xffff, "the checksum is complete");
     }
 
     #[test]
