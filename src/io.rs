@@ -183,12 +183,13 @@ struct Blocking {
 }
 
 impl Blocking {
-    /// Fails if the interrupt is triggered; otherwise, when a call that starts now gives up.
+    /// Fails if the interrupt is triggered; otherwise, when a call that starts now gives up. A
+    /// timeout that ends later than the clock can tell never ends.
     fn start(&self) -> io::Result<Option<Instant>> {
         if self.signal().is_some_and(|signal| signal.is_set()) {
             return Err(sys::interrupted());
         }
-        Ok(self.timeout.map(|timeout| Instant::now() + timeout))
+        Ok(self.timeout.and_then(|timeout| Instant::now().checked_add(timeout)))
     }
 
     fn signal(&self) -> Option<&sys::Signal> {
@@ -1143,6 +1144,14 @@ mod tests {
         drop((block, blocks, pool));
         assert_eq!(owned.data(), b"abcd");
         drop(owned);
+    }
+
+    #[test]
+    fn a_timeout_too_long_to_end_is_a_wait_without_end() {
+        let blocking = Blocking { interrupt: None, timeout: Some(Duration::MAX) };
+        assert_eq!(blocking.start().unwrap(), None);
+        let blocking = Blocking { interrupt: None, timeout: Some(Duration::from_secs(1)) };
+        assert!(blocking.start().unwrap().is_some());
     }
 
     #[test]
