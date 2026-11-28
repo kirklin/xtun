@@ -791,6 +791,39 @@ fn finds_the_utun_interface_of_the_process() {
     sent_through(&mut reader, "10.92.0.1", "10.92.0.2", b"through the duplicate");
 }
 
+/// The receive buffer of a utun socket and the packets its interface queues for the reader are
+/// what the builder and the device say, the packets never more than fit the buffer.
+#[cfg(target_vendor = "apple")]
+#[test]
+#[ignore = "creates interfaces: run as root with --ignored"]
+fn receive_buffer_and_pending_packets() {
+    let (device, queues) = builder("xtuntest24").build().unwrap();
+    assert!(device.receive_buffer().unwrap() >= 1 << 20);
+    assert_eq!(device.max_pending_packets().unwrap(), 64);
+    drop((device, queues));
+
+    let tuned = |device: &Tun| (device.receive_buffer().unwrap(), device.max_pending_packets().unwrap());
+    let (device, _queues) = builder("xtuntest24").receive_buffer(256 << 10).max_pending_packets(150).build().unwrap();
+    assert_eq!(tuned(&device), (256 << 10, 150));
+    // Larger packets fit fewer to the buffer, and the number the builder named is back with
+    // the MTU that has room for it.
+    device.set_mtu(2000).unwrap();
+    assert_eq!(tuned(&device), (256 << 10, 114));
+    device.set_mtu(1500).unwrap();
+    assert_eq!(tuned(&device), (256 << 10, 150));
+    // More packets than fit the buffer are cut down to what fits, until the buffer has room.
+    device.set_max_pending_packets(1000).unwrap();
+    assert_eq!(tuned(&device), (256 << 10, 152));
+    device.set_receive_buffer(4 << 20).unwrap();
+    assert_eq!(tuned(&device), (4 << 20, 1000));
+    // What the system could not take is refused and changes nothing.
+    assert_eq!(device.set_max_pending_packets(0).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    assert_eq!(device.set_receive_buffer(0).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    assert!(device.set_receive_buffer(1 << 30).is_err(), "a buffer above the system's limit");
+    assert_eq!(tuned(&device), (4 << 20, 1000));
+    assert!(builder("xtuntest24").receive_buffer(1 << 30).build().is_err(), "a buffer above the system's limit");
+}
+
 #[test]
 #[ignore = "creates interfaces: run as root with --ignored"]
 fn hands_over_its_descriptor() {

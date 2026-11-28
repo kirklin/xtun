@@ -10,8 +10,8 @@ mod tap;
 use std::io::{Error, ErrorKind, Result};
 use std::mem::{size_of, zeroed};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use xtun_wire::{Family, Framing, Prefix, Takes};
 
@@ -24,12 +24,23 @@ use super::unix::transport::{Facts, Sink, Source};
 use super::unix::{Queue, read_name, set_cloexec, set_nonblocking};
 use crate::device::{Offload, Options};
 
-/// The socket buffer for packets the interface hands over; the kernel caps it at
-/// `kern.ipc.maxsockbuf`.
+/// The socket buffer for packets the interface hands over, unless the builder names one; the
+/// kernel caps it at `kern.ipc.maxsockbuf`.
 const RECEIVE_BUFFER: libc::c_int = 8 << 20;
 const RECEIVE_BUFFER_MINIMUM: libc::c_int = 1 << 20;
-/// Packets the interface may queue for the reader before it pauses.
-const MAX_PENDING_PACKETS: usize = 64;
+/// Packets the interface may queue for the reader before it pauses, unless the builder names a
+/// number.
+const MAX_PENDING_PACKETS: libc::c_int = 64;
+
+/// What a utun socket was told about its receive buffer and the packets its interface queues
+/// for the reader. A change of the MTU applies both again.
+#[derive(Clone, Copy, Default)]
+struct Tuning {
+    /// The receive buffer in bytes; left out, the largest the system allows up to 8 MiB.
+    receive_buffer: Option<libc::c_int>,
+    /// The most packets queued for the reader; left out, 64.
+    max_pending_packets: Option<libc::c_int>,
+}
 
 /// A utun device.
 pub struct Tun {
@@ -37,6 +48,8 @@ pub struct Tun {
     queue: Arc<Queue>,
     /// Whether packets pass with the address family in front; the kernel always has it there.
     packet_information: AtomicBool,
+    /// Held while the socket is tuned, so that what it was told and what it has agree.
+    tuning: Mutex<Tuning>,
 }
 
 impl Facts for Tun {
@@ -70,7 +83,11 @@ impl super::Tunnel for Tun {
                 .and_then(|number| number.checked_add(1))
                 .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "a utun interface is called utun and a number"))?,
         };
-        let tun = Tun::wrap(connect(unit)?)?;
+        let tuning = Tuning {
+            receive_buffer: options.receive_buffer.map(|bytes| positive(bytes, "the receive buffer in bytes")).transpose()?,
+            max_pending_packets: options.max_pending_packets.map(|packets| positive(packets, "the number of pending packets")).transpose()?,
+        };
+        let tun = Tun::wrap(connect(unit)?, tuning)?;
         tun.packet_information.store(options.packet_information, Ordering::Relaxed);
         Ok(tun)
     }
@@ -107,9 +124,10 @@ impl super::Tunnel for Tun {
     }
 
     fn set_mtu(&self, mtu: u32) -> Result<()> {
+        let tuning = self.tuning.lock().unwrap_or_else(PoisonError::into_inner);
         self.interface.set_mtu(mtu)?;
         // Larger packets fit fewer to the receive buffer.
-        tune(self.queue.raw_fd(), mtu as usize)
+        tune(self.queue.raw_fd(), mtu as usize, *tuning)
     }
 }
 
@@ -121,10 +139,10 @@ impl super::Descriptors for Tun {
     }
 
     fn into_fd(self) -> std::result::Result<OwnedFd, Tun> {
-        let Tun { interface, queue, packet_information } = self;
+        let Tun { interface, queue, packet_information, tuning } = self;
         match Arc::try_unwrap(queue) {
             Ok(queue) => Ok(queue.into_fd()),
-            Err(queue) => Err(Tun { interface, queue, packet_information }),
+            Err(queue) => Err(Tun { interface, queue, packet_information, tuning }),
         }
     }
 }
@@ -134,7 +152,7 @@ impl super::Adopt for Tun {
         if ethernet {
             return Err(Error::new(ErrorKind::InvalidInput, "a utun interface carries IP packets, not Ethernet frames"));
         }
-        Tun::wrap(fd)
+        Tun::wrap(fd, Tuning::default())
     }
 }
 
@@ -172,7 +190,7 @@ impl Tun {
                 return Err(Error::last_os_error());
             }
             // SAFETY: `copy` is new and owned by nobody else.
-            return Tun::wrap(unsafe { OwnedFd::from_raw_fd(copy) });
+            return Tun::wrap(unsafe { OwnedFd::from_raw_fd(copy) }, Tuning::default());
         }
         Err(match refused.filter(|_| utun.is_none()) {
             Some(error) => Error::new(error.kind(), format!("no control socket of the process tells the id of the utun control: {error}")),
@@ -187,9 +205,40 @@ impl Tun {
         Ok(())
     }
 
+    /// The receive buffer of the socket, in bytes.
+    pub fn receive_buffer(&self) -> Result<u32> {
+        Ok(getsockopt(self.queue.raw_fd(), libc::SOL_SOCKET, libc::SO_RCVBUF)? as u32)
+    }
+
+    /// Sets the receive buffer of the socket, and limits the packets queued for the reader to
+    /// what fits it.
+    pub fn set_receive_buffer(&self, bytes: u32) -> Result<()> {
+        let size = positive(bytes, "the receive buffer in bytes")?;
+        let mut tuning = self.tuning.lock().unwrap_or_else(PoisonError::into_inner);
+        let wanted = Tuning { receive_buffer: Some(size), ..*tuning };
+        tune(self.queue.raw_fd(), self.interface.mtu()? as usize, wanted)?;
+        *tuning = wanted;
+        Ok(())
+    }
+
+    /// How many packets the interface may queue for the reader before it pauses.
+    pub fn max_pending_packets(&self) -> Result<u32> {
+        Ok(getsockopt(self.queue.raw_fd(), SYSPROTO_CONTROL, UTUN_OPT_MAX_PENDING_PACKETS)? as u32)
+    }
+
+    /// Sets how many packets the interface may queue for the reader: as many as fit the receive
+    /// buffer at most.
+    pub fn set_max_pending_packets(&self, packets: u32) -> Result<()> {
+        let most = positive(packets, "the number of pending packets")?;
+        let mut tuning = self.tuning.lock().unwrap_or_else(PoisonError::into_inner);
+        queue_pending(self.queue.raw_fd(), self.interface.mtu()? as usize, most)?;
+        tuning.max_pending_packets = Some(most);
+        Ok(())
+    }
+
     /// Wraps the control socket of a utun interface. Its flags, which every duplicate of the
     /// socket shares, change only once it is known to be one.
-    fn wrap(fd: OwnedFd) -> Result<Tun> {
+    fn wrap(fd: OwnedFd, tuning: Tuning) -> Result<Tun> {
         let utun = match peer_control(fd.as_raw_fd()) {
             Some(peer) => control_id(fd.as_raw_fd())? == peer,
             None => false,
@@ -201,8 +250,8 @@ impl Tun {
         set_nonblocking(fd.as_raw_fd())?;
         set_cloexec(fd.as_raw_fd())?;
         let interface = Interface::new(&name, false)?;
-        tune(fd.as_raw_fd(), interface.mtu()? as usize)?;
-        Ok(Tun { interface, queue: Arc::new(Queue::new(fd)), packet_information: AtomicBool::new(false) })
+        tune(fd.as_raw_fd(), interface.mtu()? as usize, tuning)?;
+        Ok(Tun { interface, queue: Arc::new(Queue::new(fd)), packet_information: AtomicBool::new(false), tuning: Mutex::new(tuning) })
     }
 
     fn queue(&self, queue: usize) -> Result<&Arc<Queue>> {
@@ -287,25 +336,54 @@ fn interface_name(fd: RawFd) -> Result<String> {
     Ok(read_name(&name))
 }
 
-/// Raises the receive buffer and lets the interface queue that many packets for the reader, so
-/// one `recvmsg_x` takes many. The driver queues one packet by default and pauses until it is
-/// read; it drops packets once the buffer is full, so the count stays inside the buffer.
-fn tune(fd: RawFd, mtu: usize) -> Result<()> {
-    let mut size = RECEIVE_BUFFER;
-    while size >= RECEIVE_BUFFER_MINIMUM {
-        if setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, size).is_ok() {
-            break;
+/// `value` as the system takes it: an `int` above zero.
+fn positive(value: u32, what: &str) -> Result<libc::c_int> {
+    libc::c_int::try_from(value)
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, format!("{what} is between 1 and {}", libc::c_int::MAX)))
+}
+
+/// Sets the receive buffer and lets the interface queue packets for the reader, so one
+/// `recvmsg_x` takes many. The driver queues one packet by default and pauses until it is read.
+/// A buffer that `tuning` names has to be one the system allows; without one, the largest it
+/// allows is taken.
+fn tune(fd: RawFd, mtu: usize, tuning: Tuning) -> Result<()> {
+    match tuning.receive_buffer {
+        Some(size) => setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, size)?,
+        None => {
+            let mut size = RECEIVE_BUFFER;
+            while size >= RECEIVE_BUFFER_MINIMUM {
+                if setsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, size).is_ok() {
+                    break;
+                }
+                size /= 2;
+            }
         }
-        size /= 2;
     }
-    let mut current: libc::c_int = 0;
+    queue_pending(fd, mtu, tuning.max_pending_packets.unwrap_or(MAX_PENDING_PACKETS))
+}
+
+/// Lets the interface queue up to `most` packets for the reader, and no more than fit the
+/// receive buffer: the driver drops packets once the buffer is full.
+fn queue_pending(fd: RawFd, mtu: usize, most: libc::c_int) -> Result<()> {
+    let buffer = getsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF)?;
+    setsockopt(fd, SYSPROTO_CONTROL, UTUN_OPT_MAX_PENDING_PACKETS, pending(buffer, mtu, most))
+}
+
+/// How many packets of `mtu` bytes a receive buffer of `buffer` bytes has room for: `most` at
+/// most, and one at least.
+fn pending(buffer: libc::c_int, mtu: usize, most: libc::c_int) -> libc::c_int {
+    let fit = buffer.max(0) as usize / 8 * 7 / mtu.saturating_add(4);
+    libc::c_int::try_from(fit).unwrap_or(libc::c_int::MAX).clamp(1, most)
+}
+
+fn getsockopt(fd: RawFd, level: libc::c_int, option: libc::c_int) -> Result<libc::c_int> {
+    let mut value: libc::c_int = 0;
     let mut length = size_of::<libc::c_int>() as libc::socklen_t;
-    // SAFETY: SO_RCVBUF writes one int.
-    if unsafe { libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_RCVBUF, (&raw mut current).cast(), &mut length) } < 0 {
-        return Err(Error::last_os_error());
-    }
-    let pending = (current.max(0) as usize / 8 * 7 / (mtu + 4)).clamp(1, MAX_PENDING_PACKETS);
-    setsockopt(fd, SYSPROTO_CONTROL, UTUN_OPT_MAX_PENDING_PACKETS, pending as libc::c_int)
+    // SAFETY: the option writes one int.
+    let got = unsafe { libc::getsockopt(fd, level, option, (&raw mut value).cast(), &mut length) };
+    if got < 0 { Err(Error::last_os_error()) } else { Ok(value) }
 }
 
 fn setsockopt(fd: RawFd, level: libc::c_int, option: libc::c_int, value: libc::c_int) -> Result<()> {
@@ -331,7 +409,36 @@ mod tests {
         };
         assert!(blocking(ours.as_raw_fd()));
         let duplicate = OwnedFd::from(ours.try_clone().unwrap());
-        assert!(Tun::wrap(duplicate).is_err());
+        assert!(Tun::wrap(duplicate, Tuning::default()).is_err());
         assert!(blocking(ours.as_raw_fd()), "the socket still blocks");
+    }
+
+    /// A receive buffer or a number of pending packets that the system could not take is
+    /// refused before an interface is made.
+    #[test]
+    fn a_receive_buffer_and_a_number_of_pending_packets_are_above_zero() {
+        for refused in [
+            crate::Tun::builder().receive_buffer(0),
+            crate::Tun::builder().receive_buffer(u32::MAX),
+            crate::Tun::builder().max_pending_packets(0),
+            crate::Tun::builder().max_pending_packets(u32::MAX),
+        ] {
+            assert_eq!(refused.build().unwrap_err().kind(), ErrorKind::InvalidInput);
+        }
+    }
+
+    #[test]
+    fn the_packets_queued_for_the_reader_fit_the_receive_buffer() {
+        // A buffer with room to spare queues as many packets as it is told.
+        assert_eq!(pending(8 << 20, 1500, 64), 64);
+        assert_eq!(pending(8 << 20, 1500, 16), 16);
+        assert_eq!(pending(4 << 20, 1500, 1000), 1000);
+        // One with less room queues what fits seven eighths of it.
+        assert_eq!(pending(256 << 10, 1500, 1000), 152);
+        assert_eq!(pending(256 << 10, 3000, 100), 76);
+        assert_eq!(pending(8192, 1500, 64), 4);
+        // One packet is queued at least.
+        assert_eq!(pending(512, 1500, 64), 1);
+        assert_eq!(pending(0, 1500, 64), 1);
     }
 }

@@ -143,6 +143,12 @@ pub struct Options {
     /// The name of the second `feth` interface of a TAP device.
     #[cfg(target_os = "macos")]
     pub peer_name: Option<String>,
+    /// The receive buffer of a utun interface's socket, in bytes.
+    #[cfg(target_vendor = "apple")]
+    pub receive_buffer: Option<u32>,
+    /// How many packets a utun interface queues for the reader at most.
+    #[cfg(target_vendor = "apple")]
+    pub max_pending_packets: Option<u32>,
     /// What only Windows has.
     #[cfg(windows)]
     pub windows: sys::WindowsOptions,
@@ -191,6 +197,10 @@ impl<L: Layer> Default for Builder<L> {
                 group: None,
                 #[cfg(target_os = "macos")]
                 peer_name: None,
+                #[cfg(target_vendor = "apple")]
+                receive_buffer: None,
+                #[cfg(target_vendor = "apple")]
+                max_pending_packets: None,
                 #[cfg(windows)]
                 windows: sys::WindowsOptions::default(),
             },
@@ -352,6 +362,27 @@ impl Builder<Ip> {
     /// and written as they are, without checksum work or segmentation.
     pub fn packet_information(mut self, on: bool) -> Builder<Ip> {
         self.options.packet_information = on;
+        self
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+impl Builder<Ip> {
+    /// The receive buffer of the interface's socket in bytes (`SO_RCVBUF`): the room for packets
+    /// that wait for the reader. Left out, it is the largest the system allows
+    /// (`kern.ipc.maxsockbuf`) from 8 MiB down to 1 MiB; a size the system refuses fails the
+    /// build.
+    pub fn receive_buffer(mut self, bytes: u32) -> Builder<Ip> {
+        self.options.receive_buffer = Some(bytes);
+        self
+    }
+
+    /// How many packets the interface queues for the reader before it holds the rest back
+    /// (`UTUN_OPT_MAX_PENDING_PACKETS`): 64 when left out, and never more than fit the receive
+    /// buffer. Fewer keep packets from waiting long when the reader falls behind; more let a
+    /// read take a larger batch.
+    pub fn max_pending_packets(mut self, packets: u32) -> Builder<Ip> {
+        self.options.max_pending_packets = Some(packets);
         self
     }
 }
@@ -708,6 +739,28 @@ impl Device<Ip> {
         let tunnel = Arc::new(sys::Tun::packet_tunnel()?);
         let queue = Queue { tunnel: tunnel.clone(), index: 0 };
         Ok((Device { tunnel, prefix_routes: Arc::new(AtomicBool::new(true)) }, queue))
+    }
+
+    /// The receive buffer of the interface's socket, in bytes.
+    pub fn receive_buffer(&self) -> io::Result<u32> {
+        self.tunnel.receive_buffer()
+    }
+
+    /// Changes the receive buffer of the interface's socket. The packets queued for the reader
+    /// are limited again to what fits it.
+    pub fn set_receive_buffer(&self, bytes: u32) -> io::Result<()> {
+        self.tunnel.set_receive_buffer(bytes)
+    }
+
+    /// How many packets the interface queues for the reader before it holds the rest back.
+    pub fn max_pending_packets(&self) -> io::Result<u32> {
+        self.tunnel.max_pending_packets()
+    }
+
+    /// Changes how many packets the interface queues for the reader: as many as fit the receive
+    /// buffer at most.
+    pub fn set_max_pending_packets(&self, packets: u32) -> io::Result<()> {
+        self.tunnel.set_max_pending_packets(packets)
     }
 }
 
