@@ -254,13 +254,16 @@ impl Plan {
             self.push_raw(index, pieces, Header::for_packet(checksum, None), Some(key));
             return Ok(true);
         }
-        let trusted = match checksum {
-            Checksum::Partial { start, offset } => {
-                usize::from(start) == info.transport && usize::from(offset) == info.checksum_offset()
-            }
-            Checksum::Valid => true,
-            Checksum::Unverified => info.verify_parts(packet, head.len),
-        };
+        // A run gets new headers: an IPv4 UDP datagram without a checksum would get one, and an
+        // IPv4 header whose checksum is wrong a right one.
+        let trusted = info.summed(data)
+            && match checksum {
+                Checksum::Partial { start, offset } => {
+                    usize::from(start) == info.transport && usize::from(offset) == info.checksum_offset()
+                }
+                Checksum::Valid => true,
+                Checksum::Unverified => info.verify_ip_header(data) && info.verify_parts(packet, head.len),
+            };
         if !trusted {
             self.push_raw(index, pieces, Header::for_packet(checksum, None), Some(key));
             return Ok(true);
@@ -900,6 +903,33 @@ mod tests {
             })
             .collect();
         assert_eq!(out, packets);
+    }
+
+    /// An IPv4 UDP datagram without a checksum and an IPv4 packet whose header checksum is wrong
+    /// are written as they are: given new headers, the one would get a checksum and the other a
+    /// right header checksum, which the system would check.
+    #[test]
+    fn packets_whose_headers_say_otherwise_are_written_as_they_are() {
+        let mut flow = Flow::udp(false);
+        let first = flow.packet(0, &payload(1, 300));
+        flow.id = flow.id.wrapping_add(1);
+        let mut unsummed = flow.packet(0, &payload(2, 300));
+        unsummed[26..28].fill(0);
+        flow.id = flow.id.wrapping_add(1);
+        let mut misheaded = flow.packet(0, &payload(3, 300));
+        misheaded[10] ^= 0x40;
+        let packets = [first, unsummed, misheaded];
+        for checksum in [Checksum::Unverified, Checksum::Valid] {
+            let views: Vec<Packet<'_>> = packets.iter().map(|p| Packet::new(p).with_checksum(checksum)).collect();
+            let plan = planned(&virtio(true, false), &views);
+            assert_eq!(counts(&plan), [1, 1, 1], "{checksum:?}");
+            assert_eq!(Header::read(&write(&plan, &views, 1)), Header::default(), "{checksum:?}");
+            assert_eq!(write(&plan, &views, 1)[vnet::LEN..], packets[1], "{checksum:?}");
+        }
+        let views: Vec<Packet<'_>> = packets.iter().map(|p| Packet::new(p)).collect();
+        let plan = planned(&virtio(true, false), &views);
+        assert_eq!(Header::read(&write(&plan, &views, 2)), Header::default());
+        assert_eq!(write(&plan, &views, 2)[vnet::LEN..], packets[2], "the wrong header checksum stays for the system to find");
     }
 
     /// A segment that is cut again numbers its IPv4 packets one after the other from the first:

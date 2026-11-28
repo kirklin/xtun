@@ -353,6 +353,18 @@ impl Transport {
         self.verify_parts(&Packet::new(p), p.len())
     }
 
+    /// Whether the packet whose head is `head` has a transport checksum: an IPv4 UDP datagram
+    /// may go without one.
+    pub fn summed(&self, head: &[u8]) -> bool {
+        self.tcp || self.v6 || head[self.transport + 6..self.transport + 8] != [0, 0]
+    }
+
+    /// Whether the IPv4 header checksum of the packet whose head is `head` is right; an IPv6
+    /// header has none.
+    pub fn verify_ip_header(&self, head: &[u8]) -> bool {
+        self.v6 || Sum::ZERO.bytes(&head[self.link..self.transport]).fold() == 0xffff
+    }
+
     /// Whether the transport checksum of a complete packet of `total` bytes is right. An IPv4
     /// UDP packet without a checksum counts as right.
     pub fn verify_parts(&self, packet: &impl Parts, total: usize) -> bool {
