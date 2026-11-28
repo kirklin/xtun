@@ -11,13 +11,15 @@ use std::time::Instant;
 
 use xtun_wire::{Framing, Prefix, Takes, Writes};
 use windows_sys::Win32::Foundation::{
-    ERROR_DEVICE_NOT_CONNECTED, ERROR_FILE_NOT_FOUND, ERROR_INVALID_HANDLE, ERROR_IO_PENDING, GetLastError, HANDLE, STATUS_PENDING,
+    ERROR_DEVICE_NOT_CONNECTED, ERROR_FILE_NOT_FOUND, ERROR_INVALID_HANDLE, ERROR_IO_PENDING, ERROR_OPERATION_ABORTED, GetLastError, HANDLE,
+    STATUS_PENDING,
 };
 use windows_sys::Win32::Storage::FileSystem::{ReadFile, WriteFile};
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
+use windows_sys::Win32::System::Threading::{INFINITE, WaitForSingleObject};
 
 use super::tap::Tap;
-use super::wait::{Event, Signal, Watch, wait};
+use super::wait::{Event, Signal, Watch, signalled, wait};
 use crate::io::{Filled, Loan, ReaderStats, Wait, WriterStats};
 
 /// Room around the Ethernet payload the driver carries: the Ethernet header and one VLAN tag.
@@ -58,11 +60,17 @@ impl Transfer {
         &mut *self.overlapped
     }
 
-    /// Whether the driver finished the transfer, as `HasOverlappedIoCompleted` tells.
-    fn finished(&self) -> bool {
+    /// Whether the driver finished the transfer. The system writes the status before the rest of
+    /// what the transfer came to, and signals the event last: until then, another processor may
+    /// not see what the driver wrote, and a transfer started again could find the event signalled
+    /// late for the one before.
+    fn finished(&self) -> Result<bool> {
         // SAFETY: the driver writes the status in place; it is read as it is now.
         let status = unsafe { std::ptr::read_volatile(&self.overlapped.Internal) };
-        status != STATUS_PENDING as usize
+        if status == STATUS_PENDING as usize {
+            return Ok(false);
+        }
+        signalled(self.event.handle())
     }
 
     /// The bytes a finished transfer moved, or why it failed.
@@ -75,7 +83,8 @@ impl Transfer {
         Ok(moved as usize)
     }
 
-    /// Stops a running transfer and waits for it, so that its structure and buffer may go.
+    /// Stops a running transfer and waits for it, so that its structure and buffer may go: until
+    /// the system signals the event, which it does last.
     fn cancel(&mut self, handle: HANDLE) {
         if self.running {
             let mut moved = 0u32;
@@ -83,6 +92,7 @@ impl Transfer {
             unsafe {
                 CancelIoEx(handle, &*self.overlapped);
                 GetOverlappedResult(handle, &*self.overlapped, &mut moved, 1);
+                WaitForSingleObject(self.event.handle(), INFINITE);
             }
             self.running = false;
         }
@@ -146,15 +156,21 @@ impl Source {
         let handle = self.tap.handle();
         while self.collected < count {
             let read = &mut self.reads[self.awaited()];
-            if !read.finished() {
-                return Filled::dry();
-            }
-            let length = match read.result(handle) {
-                Ok(length) => length,
+            match read.finished() {
+                Ok(true) => {}
+                Ok(false) => return Filled::dry(),
                 Err(error) => return Filled::failed(error),
-            };
+            }
+            // A read that failed is collected too, and posted again with the others.
+            let result = read.result(handle);
             read.running = false;
             self.collected += 1;
+            let length = match result {
+                Ok(length) => length,
+                // The system cancels the reads of a thread that ends: they go again.
+                Err(error) if error.raw_os_error() == Some(ERROR_OPERATION_ABORTED as i32) => continue,
+                Err(error) => return Filled::failed(error),
+            };
             let raw = &mut read.buffer[..length];
             match FRAMING.decode(raw) {
                 Some(decoded) => frames.push(Loan::new(raw, decoded, None)),
@@ -174,7 +190,7 @@ impl Wait for Source {
     /// Resolves at once when the read that finishes next has finished already.
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         let read = &self.reads[self.awaited()];
-        self.watch.poll_signalled(cx, read.event.handle(), None, || Ok(read.finished()))
+        self.watch.poll_signalled(cx, read.event.handle(), None, || read.finished())
     }
 
     fn wait(&mut self, signal: Option<&Signal>, deadline: Option<Instant>) -> Result<()> {
@@ -248,11 +264,11 @@ impl Sink {
 
     /// Collects the writes that finished, oldest first; a write the driver refused counts as
     /// dropped.
-    fn reap(&mut self, stats: &mut WriterStats) {
+    fn reap(&mut self, stats: &mut WriterStats) -> Result<()> {
         let handle = self.tap.handle();
         while self.running > 0 {
             let write = &mut self.writes[self.oldest()];
-            if !write.finished() {
+            if !write.finished()? {
                 break;
             }
             let result = write.result(handle);
@@ -263,6 +279,7 @@ impl Sink {
                 Err(_) => stats.dropped += 1,
             }
         }
+        Ok(())
     }
 
     /// Which write is the oldest running one.
@@ -276,7 +293,7 @@ impl Wait for Sink {
     /// Resolves at once when the oldest running write has finished already.
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         let write = &self.writes[self.oldest()];
-        self.watch.poll_signalled(cx, write.event.handle(), None, || Ok(write.finished()))
+        self.watch.poll_signalled(cx, write.event.handle(), None, || write.finished())
     }
 
     fn wait(&mut self, signal: Option<&Signal>, deadline: Option<Instant>) -> Result<()> {
@@ -292,10 +309,10 @@ impl crate::io::Sink for Sink {
     /// Copies each write into the buffer of a free transfer and starts it, until every transfer
     /// runs.
     fn write(&mut self, list: &impl Writes, stats: &mut WriterStats) -> Result<usize> {
-        self.reap(stats);
+        self.reap(stats)?;
         for index in 0..list.count() {
             if self.running == self.writes.len() {
-                self.reap(stats);
+                self.reap(stats)?;
                 if self.running == self.writes.len() {
                     return Ok(index);
                 }
