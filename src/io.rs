@@ -24,6 +24,10 @@ const SLICE: Duration = Duration::from_micros(1000);
 /// Frames a reader holds per batch unless told otherwise.
 const FRAMES: usize = 64;
 
+/// The pieces of a packet one write takes: `writev` takes 1024 (`UIO_MAXIOV`), and the device's
+/// prefix comes first.
+const PIECES: usize = 1023;
+
 /// How one end of a queue waits for its device.
 pub trait Wait {
     /// Resolves once the device may have more to read, or room to write, after an attempt
@@ -730,7 +734,8 @@ impl<L: Layer> Writer<L> {
     }
 
     /// Writes one packet whose bytes come in pieces, such as a header and a payload, without
-    /// joining them first. Its checksums are taken as they are.
+    /// joining them first. Its checksums are taken as they are. A packet may come in up to 1023
+    /// pieces that are not empty.
     pub async fn send_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<()> {
         poll_fn(|cx| self.poll_flush(cx)).await?;
         self.put_vectored(bufs)?;
@@ -843,6 +848,10 @@ impl<L: Layer> Writer<L> {
         let size: usize = bufs.iter().map(|buf| buf.len()).sum();
         if size > takes.max_frame {
             let reason = format!("a packet is longer than the {} bytes the device takes", takes.max_frame);
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, reason));
+        }
+        if bufs.iter().filter(|buf| !buf.is_empty()).count() > PIECES {
+            let reason = format!("a packet comes in more than the {PIECES} pieces a write takes");
             return Err(io::Error::new(io::ErrorKind::InvalidInput, reason));
         }
         self.stats.packets += 1;

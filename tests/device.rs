@@ -269,6 +269,16 @@ fn blocking_calls_need_no_runtime() {
     let mut answer = [0u8; 64];
     let (size, _) = socket.recv_from(&mut answer).unwrap();
     assert_eq!(&answer[..size], b"in pieces");
+    // A packet in more pieces than one write takes is refused, as `send_pieces` refuses it.
+    let back = Build { src: ip("10.78.0.2"), dst: ip("10.78.0.1"), src_port: 9, dst_port: port, ttl: 64, id: 3 };
+    let (too_many, most) = (back.udp(&[7; 1024 - 28]), back.udp(&[7; 1023 - 28]));
+    let crumbs: Vec<io::IoSlice<'_>> = too_many.chunks(1).map(io::IoSlice::new).collect();
+    let refused = writer.blocking_send_vectored(&crumbs).unwrap_err();
+    assert_eq!(refused.kind(), io::ErrorKind::InvalidInput, "{refused}");
+    let crumbs: Vec<io::IoSlice<'_>> = most.chunks(1).map(io::IoSlice::new).collect();
+    writer.blocking_send_vectored(&crumbs).unwrap();
+    let (size, _) = socket.recv_from(&mut [0u8; 1024]).unwrap();
+    assert_eq!((size, writer.stats().dropped), (most.len() - 28, 0), "1023 pieces are taken");
 
     reader.set_timeout(Some(Duration::from_millis(100)));
     let started = std::time::Instant::now();
