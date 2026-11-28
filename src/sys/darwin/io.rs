@@ -154,11 +154,23 @@ impl Write for MessageWrites {
         let total = list.count();
         let mut next = 0;
         while next < total {
-            let chunk = (total - next).min(SEND_BATCH);
             iov.clear();
             headers.0.clear();
-            for index in next..next + chunk {
-                headers.push(iov.gather(list, index));
+            // Up to the first empty write: the system says of a call with an empty message that
+            // it took the messages before it, and sends none of them.
+            for index in next..total.min(next + SEND_BATCH) {
+                let pieces = iov.gather(list, index);
+                if pieces == 0 {
+                    break;
+                }
+                headers.push(pieces);
+            }
+            let chunk = headers.0.len();
+            if chunk == 0 {
+                // An empty write goes nowhere.
+                stats.dropped += 1;
+                next += 1;
+                continue;
             }
             headers.link(iov.as_ptr().cast_mut(), iov.len());
             let sent = {
@@ -399,6 +411,20 @@ mod tests {
         assert_eq!(found[count - 1], ((count - 1) as u32).to_be_bytes());
         assert!(!filled.dry && filled.error.is_none(), "a batch that was filled says that the socket may hold more");
         assert_eq!(stats.calls, 2);
+    }
+
+    /// The system says of a `sendmsg_x` with an empty message that it took the messages before
+    /// it, and sends none of them: an empty write goes on its own, and nowhere.
+    #[test]
+    fn an_empty_write_loses_none_of_the_writes_around_it() {
+        let (near, far) = pair();
+        let list = Pieces(vec![vec![vec![1; 20]], vec![vec![2; 20]], vec![], vec![vec![4; 20]], vec![]]);
+        let mut stats = WriterStats::default();
+        assert_eq!(MessageWrites::default().write(near.as_raw_fd(), &list, &mut stats).unwrap(), 5);
+        assert_eq!((stats.writes, stats.dropped), (3, 2));
+        let mut reads = MessageReads::new().unwrap();
+        let (found, _) = read(&mut reads, &far, &mut Slots::new(8).unwrap(), 8, &mut ReaderStats::default());
+        assert_eq!(found, [vec![1; 20], vec![2; 20], vec![4; 20]]);
     }
 
     #[test]
