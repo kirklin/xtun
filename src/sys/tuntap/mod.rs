@@ -583,17 +583,40 @@ fn device_name(fd: RawFd) -> Result<String> {
     if unsafe { libc::fstat(fd, &mut status) } < 0 {
         return Err(Error::last_os_error());
     }
-    // SAFETY: `devname` returns a NUL-terminated name or null; it is copied at once.
-    let name = unsafe { libc::devname(status.st_rdev, libc::S_IFCHR) };
-    if name.is_null() {
-        return Err(Error::new(ErrorKind::InvalidInput, "the descriptor is not a tun or tap device"));
+    let refused = || Error::new(ErrorKind::InvalidInput, "the descriptor is not a tun or tap device");
+    if status.st_mode & libc::S_IFMT != libc::S_IFCHR {
+        return Err(refused());
     }
-    // SAFETY: as above.
-    let name = unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy().into_owned();
+    let name = node_name(status.st_rdev).ok_or_else(refused)?;
     if !name.starts_with(os::TUN_PREFIX) && !name.starts_with(os::TAP_PREFIX) {
         return Err(Error::new(ErrorKind::InvalidInput, format!("{name} is not a tun or tap device")));
     }
     Ok(name)
+}
+
+/// The name of the character device `device` in `/dev`.
+#[cfg(target_os = "netbsd")]
+fn node_name(device: libc::dev_t) -> Option<String> {
+    unsafe extern "C" {
+        /// `devname` into a buffer of the caller's, which any thread may call at once.
+        fn devname_r(device: libc::dev_t, kind: libc::mode_t, path: *mut libc::c_char, length: libc::size_t) -> libc::c_int;
+    }
+    let mut name = [0 as libc::c_char; libc::PATH_MAX as usize];
+    // SAFETY: `name` is writable for its length, which the call is told.
+    (unsafe { devname_r(device, libc::S_IFCHR, name.as_mut_ptr(), name.len()) } == 0).then(|| read_name(&name))
+}
+
+/// The name of the character device `device` in `/dev`. OpenBSD's `devname` hands out a buffer
+/// of its own, which every call writes: the calls of this process take turns, and copy it at once.
+#[cfg(target_os = "openbsd")]
+fn node_name(device: libc::dev_t) -> Option<String> {
+    static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _turn = TURN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // SAFETY: `devname` returns a NUL-terminated name or null, which is copied before another
+    // call of this process can write it.
+    let name = unsafe { libc::devname(device, libc::S_IFCHR) };
+    // SAFETY: as above.
+    (!name.is_null()).then(|| unsafe { std::ffi::CStr::from_ptr(name) }.to_string_lossy().into_owned())
 }
 
 /// Whether a descriptor is of a tap device. FreeBSD renames interfaces, so the name of the
