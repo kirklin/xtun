@@ -221,11 +221,13 @@ impl Interface {
         if address.peer.is_some() || net.prefix_len() == net.max_prefix_len() {
             return Ok(());
         }
-        // An Ethernet interface gets the route to its subnet from the system; a point-to-point
-        // interface does not.
+        // An Ethernet interface gets the route to its subnet from the system, and so does a
+        // point-to-point interface for an IPv6 address; a point-to-point interface does not for
+        // an IPv4 address.
         match (self.ethernet, prefix_route) {
             (false, true) => tolerate(route(RTM_ADD, self.index, net.trunc(), None), libc::EEXIST),
             (true, false) => tolerate(route(RTM_DELETE, self.index, net.trunc(), None), libc::ESRCH),
+            (false, false) if net.addr().is_ipv6() => tolerate(route(RTM_DELETE, self.index, net.trunc(), None), libc::ESRCH),
             _ => Ok(()),
         }
     }
