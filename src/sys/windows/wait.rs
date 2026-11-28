@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows_sys::Win32::System::Threading::{
     CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CREATE_WAITABLE_TIMER_MANUAL_RESET, CloseThreadpoolWait, CreateEventW, CreateThreadpoolWait,
-    CreateWaitableTimerExW, INFINITE, PTP_CALLBACK_INSTANCE, PTP_WAIT, ResetEvent, SetEvent, SetThreadpoolWait, SetWaitableTimer,
-    TIMER_ALL_ACCESS, WaitForMultipleObjects, WaitForSingleObject, WaitForThreadpoolWaitCallbacks,
+    CreateWaitableTimerExW, DisassociateCurrentThreadFromCallback, INFINITE, PTP_CALLBACK_INSTANCE, PTP_WAIT, ResetEvent, SetEvent,
+    SetThreadpoolWait, SetWaitableTimer, TIMER_ALL_ACCESS, WaitForMultipleObjects, WaitForSingleObject, WaitForThreadpoolWaitCallbacks,
 };
 
 /// An event object of our own.
@@ -155,16 +155,28 @@ unsafe impl Send for Watch {}
 // SAFETY: as above.
 unsafe impl Sync for Watch {}
 
-unsafe extern "system" fn fired(_instance: PTP_CALLBACK_INSTANCE, context: *mut c_void, _wait: PTP_WAIT, _result: u32) {
-    // SAFETY: `context` is the state, which outlives every callback (see `Drop`).
-    let state = unsafe { &*context.cast::<State>() };
+/// Wakes the task. The task the waker stands for may be dropped while it is woken, on this
+/// thread, and drop the watch with it: before it wakes the task, the callback has done with the
+/// state but for its own hold on it, and no longer counts as a callback of the wait, which a
+/// watch that is disarmed or dropped waits for.
+unsafe extern "system" fn fired(instance: PTP_CALLBACK_INSTANCE, context: *mut c_void, _wait: PTP_WAIT, _result: u32) {
+    // SAFETY: `context` is the state of the watch, which holds it until no callback of its wait
+    // counts as running or is pending (see `Drop`): until the callback lets go of the wait below.
+    let state = unsafe {
+        Arc::increment_strong_count(context.cast::<State>());
+        Arc::from_raw(context.cast::<State>())
+    };
     // The thread pool watches the event no longer.
     let kept = state.keep.lock().expect("keep").take();
     state.fired.store(true, Ordering::Release);
-    if let Some(waker) = state.waker.lock().expect("waker").take() {
+    let waker = state.waker.lock().expect("waker").take();
+    // SAFETY: `instance` is the instance of this callback.
+    unsafe { DisassociateCurrentThreadFromCallback(instance) };
+    if let Some(waker) = waker {
         waker.wake();
     }
     drop(kept);
+    drop(state);
 }
 
 impl Watch {
@@ -217,8 +229,8 @@ impl Watch {
     /// Stops watching the event, so that it may be closed.
     pub fn disarm(&mut self) {
         if self.armed.take().is_some() {
-            // SAFETY: stops the wait and waits for a callback that is running; pending callbacks
-            // are cancelled.
+            // SAFETY: stops the wait and waits for a callback that is running until it lets go of
+            // the wait, which it does before it wakes anything; pending callbacks are cancelled.
             unsafe {
                 SetThreadpoolWait(self.wait, std::ptr::null_mut(), std::ptr::null());
                 WaitForThreadpoolWaitCallbacks(self.wait, 1);
@@ -232,7 +244,8 @@ impl Watch {
 impl Drop for Watch {
     fn drop(&mut self) {
         self.disarm();
-        // SAFETY: no callback runs or is pending any more, so none can reach the state.
+        // SAFETY: no callback is pending any more, and one that still runs holds the state
+        // itself; the system frees the wait once that callback returns.
         unsafe { CloseThreadpoolWait(self.wait) };
     }
 }
