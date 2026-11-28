@@ -14,8 +14,9 @@ use crate::Packet;
 use crate::io::{Reader, Writer};
 use crate::layer::{Ip, Layer};
 
-/// Room kept ahead for one packet: the largest IP packet.
-const PACKET: usize = 65_536;
+/// Room kept ahead for one packet: the largest frame a reader holds, an IPv6 packet of 65,535
+/// bytes of payload and its header behind an Ethernet header and VLAN tags, rounded up.
+const PACKET: usize = 65_536 + 128;
 /// The blocks the buffers of a stream's packets are cut from.
 const BLOCK: usize = 1 << 20;
 /// Packets a sink gathers before it hands them to the writer.
@@ -72,7 +73,8 @@ impl<L: Layer> Stream for PacketStream<L> {
 /// A writer as a sink of packets of type `B`, such as `Vec<u8>` or `Bytes`. Packets are copied
 /// as they come and handed to the writer together when the sink is flushed or has gathered a
 /// batch, so the writer joins and writes them as one batch. Their checksums are taken as
-/// unverified.
+/// unverified. A batch the writer refuses, for a packet longer than the device takes, fails the
+/// call that handed it over and is gone; the sink goes on with the packets that come after.
 pub struct PacketSink<B, L: Layer = Ip> {
     writer: Writer<L>,
     bytes: Vec<u8>,
@@ -103,12 +105,17 @@ impl<B: AsRef<[u8]>, L: Layer> PacketSink<B, L> {
         self.writer
     }
 
+    /// Hands the gathered packets to the writer, which takes them or refuses them together, and
+    /// waits until it wrote them.
     fn poll_write(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if !self.packets.is_empty() {
-            let packets: Vec<Packet<'_>> = self.packets.iter().map(|range| Packet::new(&self.bytes[range.clone()])).collect();
-            ready!(self.writer.poll_send(cx, &packets))?;
+            let handed = {
+                let packets: Vec<Packet<'_>> = self.packets.iter().map(|range| Packet::new(&self.bytes[range.clone()])).collect();
+                ready!(self.writer.poll_send(cx, &packets))
+            };
             self.packets.clear();
             self.bytes.clear();
+            handed?;
         }
         self.writer.poll_writable(cx)
     }
