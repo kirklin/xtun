@@ -19,7 +19,7 @@ use crate::cut::{Cut, MAX_HEADER, complete_into, segment_header_len_head};
 use crate::framing::{Framing, Prefix};
 use crate::packet::{
     ACK, Checksum, Gso, GsoKind, Head, PSH, Packet, Parts, TCP, Transport, UDP, each_in, first_byte, invalid, ipv4_header_checksum,
-    link_len_head, pseudo, write_u16,
+    link_len_head, pseudo, read_u16, write_u16,
 };
 use crate::tunhdr;
 use crate::vnet::{self, Header};
@@ -356,10 +356,14 @@ impl Plan {
         }
         let first = packets[write.first as usize].head();
         let ip = info.link;
+        // A segment that is cut again numbers its IPv4 packets one after the other from the first.
         let same_ip = if info.v6 {
             first[ip..ip + 4] == data[ip..ip + 4] && first[ip + 7] == data[ip + 7]
         } else {
-            first[ip + 1] == data[ip + 1] && first[ip + 6] & 0xe0 == data[ip + 6] & 0xe0 && first[ip + 8] == data[ip + 8]
+            first[ip + 1] == data[ip + 1]
+                && first[ip + 6] & 0xe0 == data[ip + 6] & 0xe0
+                && first[ip + 8] == data[ip + 8]
+                && read_u16(data, ip + 4) == read_u16(first, ip + 4).wrapping_add(write.count as u16)
         };
         // The link layer headers, addresses and tags, must match as well.
         if !same_ip || first[..ip] != data[..ip] {
@@ -896,6 +900,32 @@ mod tests {
             })
             .collect();
         assert_eq!(out, packets);
+    }
+
+    /// A segment that is cut again numbers its IPv4 packets one after the other from the first:
+    /// packets numbered otherwise, such as with the zero of RFC 6864 or at random, are not
+    /// joined, so that they come out as they went in.
+    #[test]
+    fn ipv4_packets_join_while_their_identifications_count_up() {
+        for ids in [[0, 0, 0], [0x1234, 0x0815, 0xbeef], [0xfffe, 0xffff, 0]] {
+            let mut flow = Flow::tcp(false);
+            let mut seq = 7;
+            let packets: Vec<Vec<u8>> = ids
+                .iter()
+                .enumerate()
+                .map(|(index, id)| {
+                    flow.id = *id;
+                    let packet = flow.packet(seq, &payload(index as u32, 1000));
+                    seq += 1000;
+                    packet
+                })
+                .collect();
+            let views: Vec<Packet<'_>> = packets.iter().map(|p| Packet::new(p).with_checksum(Checksum::Valid)).collect();
+            let plan = planned(&virtio(true, false), &views);
+            let counting = ids[1] == ids[0].wrapping_add(1);
+            assert_eq!(counts(&plan), if counting { vec![3] } else { vec![1, 1, 1] }, "identifications {ids:?}");
+            assert_eq!(written(&plan, &views), packets, "identifications {ids:?}");
+        }
     }
 
     /// A packet of a flow whose transport header is not read, a fragment or one behind an IPv6
