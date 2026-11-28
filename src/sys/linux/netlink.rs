@@ -27,9 +27,10 @@ pub(crate) struct Netlink {
 }
 
 impl Netlink {
+    /// A socket to the kernel. It gets its address when it connects: Android 11 and later does
+    /// not let an application bind a routing socket.
     pub fn new() -> io::Result<Netlink> {
-        let mut socket = Socket::new(NETLINK_ROUTE)?;
-        socket.bind_auto()?;
+        let socket = Socket::new(NETLINK_ROUTE)?;
         socket.connect(&SocketAddr::new(0, 0))?;
         Ok(Netlink { socket, seq: 0, buffer: vec![0; 64 * 1024] })
     }
