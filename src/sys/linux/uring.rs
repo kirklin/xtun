@@ -51,7 +51,14 @@ fn available() -> Result<()> {
             "io_uring completes TUN reads and writes without waiting only from Linux 6.4 on",
         ));
     }
-    IoUring::new(2).map(drop).map_err(|error| Error::new(error.kind(), format!("io_uring is not available: {error}")))
+    // A ring that is made and entered: a system may allow the one call and refuse the other.
+    let probe = || -> Result<()> {
+        let mut ring = IoUring::new(2)?;
+        // SAFETY: a no-op refers to no memory.
+        unsafe { ring.submission().push(&opcode::Nop::new().build()) }.expect("a new ring has room");
+        ring.submit_and_wait(1).map(drop)
+    };
+    probe().map_err(|error| Error::new(error.kind(), format!("io_uring is not available: {error}")))
 }
 
 /// A ring and the size it is made with, made anew after a call that failed.
