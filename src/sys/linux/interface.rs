@@ -159,7 +159,8 @@ fn sockaddr_v4(ip: Ipv4Addr) -> libc::sockaddr {
 ///
 /// `address` must hold an IPv4 socket address.
 unsafe fn ipv4_of(address: &libc::sockaddr) -> Ipv4Addr {
-    // SAFETY: the caller says it is a `sockaddr_in`, which is no larger than a `sockaddr`.
-    let address = unsafe { &*(address as *const libc::sockaddr).cast::<libc::sockaddr_in>() };
+    // SAFETY: the caller says it is a `sockaddr_in`, which is no larger than a `sockaddr`; it is
+    // read where it lies, which a `sockaddr_in` need not be aligned for.
+    let address = unsafe { std::ptr::read_unaligned((address as *const libc::sockaddr).cast::<libc::sockaddr_in>()) };
     Ipv4Addr::from(u32::from_be(address.sin_addr.s_addr))
 }
