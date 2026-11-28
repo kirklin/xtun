@@ -539,7 +539,9 @@ impl<L: Layer> Device<L> {
     }
 
     /// Makes `net` the only address of its IP version: it is added first, and the others are
-    /// removed after, so the interface is never without one.
+    /// removed after, so the interface is never without one. An address that is there with
+    /// another prefix is removed and added again with this one, as the systems keep one prefix
+    /// for an address.
     pub fn set_address(&self, net: IpNet) -> io::Result<()> {
         self.replace_addresses(Address { net, peer: None })
     }
@@ -552,17 +554,19 @@ impl<L: Layer> Device<L> {
 
     fn replace_addresses(&self, address: Address) -> io::Result<()> {
         let net = address.net;
-        let current = self.addresses()?;
-        let present = current.contains(&net);
-        if present && address.peer.is_some() {
-            // The far end may be another one: the address is added again with it.
-            self.remove_address(net)?;
-        }
-        if !present || address.peer.is_some() {
+        let current: Vec<IpNet> = self.addresses()?.into_iter().filter(|other| other.addr().is_ipv4() == net.addr().is_ipv4()).collect();
+        // The far end of an address may be another one: the address is added again with it.
+        let kept = address.peer.is_none() && current.contains(&net);
+        if !kept {
+            // The systems know an address by itself: with another prefix, or another far end, it
+            // goes before it comes again.
+            for same in current.iter().filter(|other| other.addr() == net.addr()) {
+                self.remove_address(*same)?;
+            }
             self.insert(address)?;
         }
-        for other in current.into_iter().filter(|other| other.addr().is_ipv4() == net.addr().is_ipv4() && *other != net) {
-            self.remove_address(other)?;
+        for other in current.iter().filter(|other| other.addr() != net.addr() || (kept && **other != net)) {
+            self.remove_address(*other)?;
         }
         Ok(())
     }

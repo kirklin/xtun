@@ -680,6 +680,13 @@ fn broadcast_and_one_address_per_version() {
     let v4: Vec<_> = addresses.iter().filter(|net| net.addr().is_ipv4()).collect();
     assert_eq!(v4, [&net("10.84.2.1/24")], "{addresses:?}");
     assert!(addresses.contains(&net("fd84::1/64")), "the other IP version keeps its address: {addresses:?}");
+    // The address stays and takes the other prefix.
+    for (from, to) in [("10.84.2.1/24", "10.84.2.1/16"), ("fd84::1/64", "fd84::1/48"), ("10.84.2.1/16", "10.84.2.1/24")] {
+        device.set_address(net(to)).unwrap_or_else(|error| panic!("{from} to {to}: {error}"));
+        let addresses = device.addresses().unwrap();
+        let same: Vec<_> = addresses.iter().filter(|net| net.addr() == self::net(to).addr()).collect();
+        assert_eq!(same, [&net(to)], "{from} to {to}: {addresses:?}");
+    }
     if LINUX {
         assert_eq!(device.broadcast().unwrap(), Some("10.84.2.255".parse().unwrap()));
         // A subnet of one or two addresses has none to broadcast to.
