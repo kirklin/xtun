@@ -345,13 +345,15 @@ mod tests {
         let entry = opcode::Read::new(types::Fd(read.as_raw_fd()), buffer.as_mut_ptr(), buffer.len() as u32).build().user_data(0);
         // SAFETY: the buffer outlives the call below, which completes the request.
         unsafe { ring.get().unwrap().submission().push(&entry).unwrap() };
-        // SAFETY: the thread that waits is this one, which outlives the signals.
-        let waiter = unsafe { libc::pthread_self() };
+        // The thread that waits is this one, which outlives the signals. It goes to the other
+        // thread as a number: musl has it as a pointer, which may not go.
+        // SAFETY: plain query of this thread.
+        let waiter = unsafe { libc::pthread_self() } as usize;
         let signals = std::thread::spawn(move || {
             for _ in 0..5 {
                 std::thread::sleep(Duration::from_millis(20));
                 // SAFETY: the thread exists until this thread is joined.
-                unsafe { libc::pthread_kill(waiter, libc::SIGUSR1) };
+                unsafe { libc::pthread_kill(waiter as libc::pthread_t, libc::SIGUSR1) };
             }
             // SAFETY: one byte from a live buffer.
             assert_eq!(unsafe { libc::write(write.as_raw_fd(), b"x".as_ptr().cast(), 1) }, 1);
