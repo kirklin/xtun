@@ -85,8 +85,11 @@ impl Wait for Source {
         self.watch.poll_signalled(cx, event, session.map(|session| session as Keep), || signalled(event))
     }
 
-    /// Holds the session only for as long as it waits.
+    /// Holds the session only for as long as it waits. The session's event resets when one wait
+    /// ends, so the thread pool stops watching it for an asynchronous wait that was cancelled:
+    /// it would take the signal from this one.
     fn wait(&mut self, signal: Option<&Signal>, deadline: Option<Instant>) -> Result<()> {
+        self.watch.disarm();
         let session = self.tunnel.session();
         wait(Some(awaited(&self.tunnel, session.as_deref())), signal, deadline, None)
     }
