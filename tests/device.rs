@@ -682,6 +682,9 @@ fn broadcast_and_one_address_per_version() {
     assert!(addresses.contains(&net("fd84::1/64")), "the other IP version keeps its address: {addresses:?}");
     if LINUX {
         assert_eq!(device.broadcast().unwrap(), Some("10.84.2.255".parse().unwrap()));
+        // A subnet of one or two addresses has none to broadcast to.
+        device.set_address(net("10.84.3.1/31")).unwrap();
+        assert_eq!(device.broadcast().unwrap(), None);
     }
 }
 

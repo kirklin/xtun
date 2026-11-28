@@ -80,11 +80,13 @@ impl Interface {
         Netlink::new()?.remove_address(self.known()?, net)
     }
 
+    /// The broadcast address of the first IPv4 address. The system says 0.0.0.0 for an address
+    /// without one, such as one of a subnet of one or two addresses.
     pub fn broadcast(&self) -> Result<Option<Ipv4Addr>> {
         let mut request = self.request()?;
         match ioctl(libc::SIOCGIFBRDADDR, &mut request) {
             // SAFETY: SIOCGIFBRDADDR filled in an IPv4 socket address.
-            Ok(()) => Ok(Some(unsafe { ipv4_of(&request.ifr_ifru.ifru_broadaddr) })),
+            Ok(()) => Ok(Some(unsafe { ipv4_of(&request.ifr_ifru.ifru_broadaddr) }).filter(|address| !address.is_unspecified())),
             Err(error) if error.raw_os_error() == Some(libc::EADDRNOTAVAIL) => Ok(None),
             Err(error) => Err(error),
         }
