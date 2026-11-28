@@ -67,37 +67,66 @@ unsafe impl Send for Rooms {}
 unsafe impl Sync for Rooms {}
 
 /// Reads a utun socket: a packet per message, into a slot each, and every packet that is ready
-/// per `recvmsg_x`.
-#[derive(Default)]
+/// per `recvmsg_x`, or per as many calls as the batch takes.
 pub struct MessageReads {
     rooms: Rooms,
     headers: Headers,
+    /// The most messages one call takes: the system cuts a call for more down to
+    /// `kern.ipc.maxrecvmsgx`.
+    most: usize,
+}
+
+impl MessageReads {
+    pub(super) fn new() -> Result<MessageReads> {
+        let mut most: libc::c_uint = 0;
+        let mut length = size_of::<libc::c_uint>();
+        // SAFETY: the name is NUL-terminated, `most` is writable for `length` bytes, and nothing
+        // is written to the system.
+        let read = unsafe {
+            libc::sysctlbyname(c"kern.ipc.maxrecvmsgx".as_ptr(), (&raw mut most).cast(), &mut length, std::ptr::null_mut(), 0)
+        };
+        if read < 0 {
+            let error = std::io::Error::last_os_error();
+            return Err(std::io::Error::new(error.kind(), format!("reading kern.ipc.maxrecvmsgx: {error}")));
+        }
+        Ok(MessageReads { rooms: Rooms::default(), headers: Headers::default(), most: (most as usize).max(1) })
+    }
 }
 
 impl Read for MessageReads {
     fn read(&mut self, fd: RawFd, slots: &mut Slots, frames: usize, stats: &mut ReaderStats, mut frame: impl FnMut(Found<'_>)) -> Filled {
-        let MessageReads { rooms: Rooms(rooms), headers } = self;
-        rooms.clear();
-        headers.0.clear();
-        for slot in 0..frames {
-            let room = slots.room(slot);
-            rooms.push(libc::iovec { iov_base: room.as_mut_ptr().cast(), iov_len: room.len() });
-            headers.push(1);
-        }
-        headers.link(rooms.as_mut_ptr(), rooms.len());
-        stats.calls += 1;
-        // SAFETY: every message points at a slot of its own, which is writable.
-        let result = retry(|| unsafe { recvmsg_x(fd, headers.0.as_ptr(), headers.0.len() as libc::c_uint, libc::MSG_DONTWAIT) });
-        let filled = match result {
-            Ok(received) => {
-                for (slot, header) in headers.0[..received].iter().enumerate() {
-                    frame(slots.filled(slot, header.msg_datalen));
-                }
-                // Fewer packets than slots: the socket is empty.
-                if received < frames { Filled::dry() } else { Filled::more() }
+        let MessageReads { rooms: Rooms(rooms), headers, most } = self;
+        let mut first = 0;
+        let filled = loop {
+            let asked = (frames - first).min(*most);
+            rooms.clear();
+            headers.0.clear();
+            for slot in first..first + asked {
+                let room = slots.room(slot);
+                rooms.push(libc::iovec { iov_base: room.as_mut_ptr().cast(), iov_len: room.len() });
+                headers.push(1);
             }
-            Err(error) if error.kind() == ErrorKind::WouldBlock => Filled::dry(),
-            Err(error) => Filled::failed(error),
+            headers.link(rooms.as_mut_ptr(), rooms.len());
+            stats.calls += 1;
+            // SAFETY: every message points at a slot of its own, which is writable.
+            let result = retry(|| unsafe { recvmsg_x(fd, headers.0.as_ptr(), headers.0.len() as libc::c_uint, libc::MSG_DONTWAIT) });
+            match result {
+                Ok(received) => {
+                    for (index, header) in headers.0[..received].iter().enumerate() {
+                        frame(slots.filled(first + index, header.msg_datalen));
+                    }
+                    first += received;
+                    // Fewer packets than the call asked for: the socket is empty.
+                    if received < asked {
+                        break Filled::dry();
+                    }
+                    if first == frames {
+                        break Filled::more();
+                    }
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => break Filled::dry(),
+                Err(error) => break Filled::failed(error),
+            }
         };
         rooms.clear();
         headers.0.clear();
@@ -330,7 +359,7 @@ mod tests {
         assert_eq!((writer.writes, writer.dropped), (5, 0));
         assert!(writer.calls <= 5, "one call takes many messages");
 
-        let mut reads = MessageReads::default();
+        let mut reads = MessageReads::new().unwrap();
         let mut slots = Slots::new(8).unwrap();
         let mut reader = ReaderStats::default();
         // A batch of two slots is filled and says that the socket may hold more.
@@ -344,6 +373,32 @@ mod tests {
         let (found, filled) = read(&mut reads, &far, &mut slots, 8, &mut reader);
         assert!(found.is_empty() && filled.dry && filled.error.is_none());
         assert_eq!(reader.calls, 3);
+    }
+
+    /// The system takes no more messages per call than `kern.ipc.maxrecvmsgx`: a batch of more
+    /// slots is read with as many calls as it takes, and the socket is empty only once a call
+    /// finds fewer messages than it asked for.
+    #[test]
+    fn a_batch_larger_than_one_call_takes_is_read_whole() {
+        let (near, far) = pair();
+        for fd in [&near, &far] {
+            for option in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
+                let size: libc::c_int = 1 << 20;
+                // SAFETY: the option reads one int.
+                let set = unsafe { libc::setsockopt(fd.as_raw_fd(), libc::SOL_SOCKET, option, (&raw const size).cast(), 4) };
+                assert_eq!(set, 0);
+            }
+        }
+        let reads = MessageReads::new().unwrap();
+        let count = reads.most + 44;
+        let list = Pieces((0..count).map(|number| vec![(number as u32).to_be_bytes().to_vec()]).collect());
+        assert_eq!(MessageWrites::default().write(near.as_raw_fd(), &list, &mut WriterStats::default()).unwrap(), count);
+        let (mut reads, mut slots, mut stats) = (reads, Slots::new(count).unwrap(), ReaderStats::default());
+        let (found, filled) = read(&mut reads, &far, &mut slots, count, &mut stats);
+        assert_eq!(found.len(), count);
+        assert_eq!(found[count - 1], ((count - 1) as u32).to_be_bytes());
+        assert!(!filled.dry && filled.error.is_none(), "a batch that was filled says that the socket may hold more");
+        assert_eq!(stats.calls, 2);
     }
 
     #[test]
@@ -380,7 +435,7 @@ mod tests {
         let list = Pieces(vec![vec![vec![0x45; 20]]]);
         let error = MessageWrites::default().write(-1, &list, &mut WriterStats::default()).unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EBADF));
-        let filled = MessageReads::default().read(-1, &mut Slots::new(1).unwrap(), 1, &mut ReaderStats::default(), |_| panic!("nothing was read"));
+        let filled = MessageReads::new().unwrap().read(-1, &mut Slots::new(1).unwrap(), 1, &mut ReaderStats::default(), |_| panic!("nothing was read"));
         assert_eq!(filled.error.and_then(|error| error.raw_os_error()), Some(libc::EBADF));
     }
 
