@@ -54,17 +54,24 @@ impl crate::sys::Tunnel for Tap {
             return Err(Error::new(ErrorKind::InvalidInput, "Ethernet frames carry no packet information"));
         }
         let wanted = options.name.as_deref().unwrap_or("feth");
-        if !wanted.starts_with("feth") {
-            return Err(Error::new(ErrorKind::InvalidInput, "a layer 2 interface is called feth and a number"));
+        let wanted_peer = options.peer_name.as_deref().unwrap_or("feth");
+        if !wanted.starts_with("feth") || !wanted_peer.starts_with("feth") {
+            return Err(Error::new(ErrorKind::InvalidInput, "a layer 2 interface and its peer are called feth and a number"));
         }
         let (name, created) = create_interface(wanted, options.reuse)?;
-        let mut pair = Pair { name: name.clone(), peer: String::new(), owned: [created, false], persist: AtomicBool::new(false) };
+        let mut pair = Pair {
+            name: name.clone(),
+            peer: String::new(),
+            created: [created, false],
+            persist: AtomicBool::new(false),
+            released: AtomicBool::new(false),
+        };
         match if created { None } else { peer_of(&name)? } {
             Some(peer) => pair.peer = peer,
             None => {
-                let (peer, created) = create_interface(options.peer_name.as_deref().unwrap_or("feth"), options.reuse)?;
+                let (peer, created) = create_interface(wanted_peer, options.reuse)?;
                 pair.peer = peer;
-                pair.owned[1] = created;
+                pair.created[1] = created;
                 set_peer(&name, &pair.peer)?;
             }
         }
@@ -72,10 +79,6 @@ impl crate::sys::Tunnel for Tap {
         without_duplicate_detection(&name)?;
         let interface = Interface::new(&name, true)?;
         let peer = Interface::new(&pair.peer, true)?;
-        // A pair that was there before stays, as a persistent interface does on Linux, until
-        // the device is told it may go.
-        pair.persist.store(!created, Ordering::Relaxed);
-        pair.owned = [true, true];
         Ok(Tap { interface, peer, queue: Arc::new(Queue::read_only_readiness(bpf)), pair })
     }
 
@@ -100,8 +103,13 @@ impl crate::sys::Tunnel for Tap {
         Offload::default()
     }
 
+    /// Told not to persist, the device also takes interfaces that were there before it along
+    /// when it goes.
     fn set_persist(&self, persist: bool) -> Result<()> {
         self.pair.persist.store(persist, Ordering::Relaxed);
+        if !persist {
+            self.pair.released.store(true, Ordering::Relaxed);
+        }
         Ok(())
     }
 
@@ -143,13 +151,16 @@ impl crate::sys::Descriptors for Tap {
 }
 
 /// The two `feth` interfaces of a device by their names: the device's own and the second one.
+/// Unless the device persists, those created for it go away with it; one that was there before
+/// stays, as a persistent interface does on Linux, until the device is told it may go.
 struct Pair {
     name: String,
     peer: String,
-    /// Which interfaces go away with the device unless it persists: while the device is set up,
-    /// those created for it; once it is, both.
-    owned: [bool; 2],
+    /// Which of the two were created for the device.
+    created: [bool; 2],
     persist: AtomicBool,
+    /// The device was told it may take the interfaces that were there before it along.
+    released: AtomicBool,
 }
 
 impl Drop for Pair {
@@ -157,8 +168,9 @@ impl Drop for Pair {
         if self.persist.load(Ordering::Relaxed) {
             return;
         }
-        for (name, owned) in [(&self.peer, self.owned[1]), (&self.name, self.owned[0])] {
-            if owned {
+        let released = self.released.load(Ordering::Relaxed);
+        for (name, created) in [(&self.peer, self.created[1]), (&self.name, self.created[0])] {
+            if created || released {
                 // Nothing is left to report the failure to; the interface stays behind.
                 let _ = destroy(name);
             }
