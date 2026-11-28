@@ -49,7 +49,7 @@ fn ends<L: xtun::Layer>(mut queues: Vec<Queue<L>>) -> (Reader<L>, Writer<L>) {
 /// Whether Windows has an adapter whose interface is called `name`.
 fn exists(name: &str) -> bool {
     use windows_sys::Win32::NetworkManagement::IpHelper::{GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH};
-    let wide: Vec<u16> = name.encode_utf16().chain([0]).collect();
+    let wide: Vec<u16> = name.encode_utf16().collect();
     let mut size = 0u32;
     // SAFETY: without a buffer the call only reports the size it needs.
     unsafe { GetAdaptersAddresses(0, 0, std::ptr::null(), std::ptr::null_mut(), &mut size) };
@@ -61,8 +61,13 @@ fn exists(name: &str) -> bool {
     assert_eq!(unsafe { GetAdaptersAddresses(0, 0, std::ptr::null(), list, &mut size) }, 0);
     let mut adapter = list.cast_const();
     while !adapter.is_null() {
-        // SAFETY: the list ends with a null pointer, and every name with a NUL.
-        let found = unsafe { std::slice::from_raw_parts((*adapter).FriendlyName, wide.len()) == &wide[..] };
+        // SAFETY: the list ends with a null pointer, and every name with a NUL, which ends what
+        // is read of it.
+        let found = unsafe {
+            let friendly = (*adapter).FriendlyName;
+            let length = (0..).take_while(|&at| *friendly.add(at) != 0).count();
+            std::slice::from_raw_parts(friendly, length) == &wide[..]
+        };
         if found {
             return true;
         }
