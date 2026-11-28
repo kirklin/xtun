@@ -3,7 +3,7 @@ members = ["wire", "bench"]
 
 [package]
 name = "xtun"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 rust-version = "1.88"
 description = "TUN and TAP interfaces on Linux, Android, the Apple systems, FreeBSD, NetBSD, OpenBSD, illumos and Windows, with batched and offloaded packet I/O"
