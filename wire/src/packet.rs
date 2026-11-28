@@ -364,6 +364,45 @@ impl Transport {
     }
 }
 
+/// Where the transport header of the IP packet at `link` starts, past any IPv6 extension
+/// headers, and its protocol, for an IPv6 packet if the first says so. A fragment that is not
+/// the whole packet is refused: its transport checksum covers bytes that lie in other fragments.
+pub(crate) fn transport_of(data: &[u8], link: usize) -> io::Result<(bool, usize, u8)> {
+    let ip = data.get(link..).ok_or_else(|| invalid("the packet ends before its IP header"))?;
+    match ip.first().map(|byte| byte >> 4) {
+        Some(4) if ip.len() >= 20 => {
+            let header = usize::from(ip[0] & 0x0f) * 4;
+            if header < 20 {
+                return Err(invalid("the IPv4 header length is out of range"));
+            }
+            if ip[6] & 0x3f != 0 || ip[7] != 0 {
+                return Err(invalid("the packet is a fragment"));
+            }
+            Ok((false, link + header, ip[9]))
+        }
+        Some(6) if ip.len() >= 40 => {
+            let (mut at, mut next) = (link + 40, ip[6]);
+            // Hop-by-hop options, routing, fragment and destination options headers.
+            while matches!(next, 0 | 43 | 44 | 60) {
+                let header = data.get(at..at + 8).ok_or_else(|| invalid("an IPv6 extension header is cut off"))?;
+                let length = if next == 44 {
+                    // The offset of the fragment and the flag that more follow.
+                    if u16::from_be_bytes([header[2], header[3]]) & 0xfff9 != 0 {
+                        return Err(invalid("the packet is a fragment"));
+                    }
+                    8
+                } else {
+                    (usize::from(header[1]) + 1) * 8
+                };
+                next = header[0];
+                at += length;
+            }
+            Ok((true, at, next))
+        }
+        _ => Err(invalid("the packet is neither IPv4 nor IPv6")),
+    }
+}
+
 /// The pseudo header of the IP header that starts `ip`.
 pub(crate) fn pseudo(ip: &[u8], v6: bool, protocol: u8, length: usize) -> Sum {
     if v6 {

@@ -9,7 +9,7 @@ use std::io;
 use crate::cut::segment_header_len;
 use crate::packet::{
     CWR, Checksum, Gso, GsoKind, Head, TCP, TCP_CHECKSUM, Transport, UDP, UDP_CHECKSUM, adjust_partial, invalid, link_len_head,
-    read_u16, write_u16,
+    read_u16, transport_of, write_u16,
 };
 use crate::vnet;
 
@@ -21,36 +21,12 @@ const IPV4_CSUM: u16 = 1 << 8;
 const TCP_CSUM: u16 = 1 << 9;
 const UDP_CSUM: u16 = 1 << 10;
 const ICMP_CSUM: u16 = 1 << 11;
+/// The flags that leave something of the transport header to the reader.
+const TRANSPORT: u16 = TCP_CSUM | UDP_CSUM | ICMP_CSUM | MSS;
 
 const ICMP: u8 = 1;
 const ICMPV6: u8 = 58;
 const ICMP_CHECKSUM: usize = 2;
-
-/// Where the transport header of the IP packet at `link` starts, past any IPv6 extension headers,
-/// and its protocol.
-fn transport_of(data: &[u8], link: usize) -> io::Result<(bool, usize, u8)> {
-    let ip = data.get(link..).ok_or_else(|| invalid("the packet ends before its IP header"))?;
-    match ip.first().map(|byte| byte >> 4) {
-        Some(4) if ip.len() >= 20 => {
-            let header = usize::from(ip[0] & 0x0f) * 4;
-            if header < 20 {
-                return Err(invalid("the IPv4 header length is out of range"));
-            }
-            Ok((false, link + header, ip[9]))
-        }
-        Some(6) if ip.len() >= 40 => {
-            let (mut at, mut next) = (link + 40, ip[6]);
-            // Hop-by-hop options, routing, fragment and destination options headers.
-            while matches!(next, 0 | 43 | 44 | 60) {
-                let header = data.get(at..at + 2).ok_or_else(|| invalid("an IPv6 extension header is cut off"))?;
-                next = header[0];
-                at += if next == 44 { 8 } else { (usize::from(header[1]) + 1) * 8 };
-            }
-            Ok((true, at, next))
-        }
-        _ => Err(invalid("the packet is neither IPv4 nor IPv6")),
-    }
-}
 
 /// The checksum field's place from the transport header on, for the protocols OpenBSD offloads.
 fn checksum_offset(protocol: u8) -> Option<usize> {
@@ -59,6 +35,16 @@ fn checksum_offset(protocol: u8) -> Option<usize> {
         UDP => Some(UDP_CHECKSUM),
         ICMP | ICMPV6 => Some(ICMP_CHECKSUM),
         _ => None,
+    }
+}
+
+/// The flags that may leave something of a packet of `protocol` to the reader.
+fn flags_of(protocol: u8) -> u16 {
+    match protocol {
+        TCP => TCP_CSUM | MSS,
+        UDP => UDP_CSUM,
+        ICMP | ICMPV6 => ICMP_CSUM,
+        _ => 0,
     }
 }
 
@@ -74,7 +60,7 @@ pub(crate) fn vlan_tag(head: &[u8]) -> Option<u16> {
 pub(crate) fn describe(head: &[u8], data: &mut [u8], link: Option<usize>) -> io::Result<(Checksum, Option<Gso>)> {
     let flags = u16::from_ne_bytes([head[0], head[1]]);
     let mss = u16::from_ne_bytes([head[6], head[7]]);
-    if flags & (IPV4_CSUM | TCP_CSUM | UDP_CSUM | ICMP_CSUM | MSS) == 0 {
+    if flags & (IPV4_CSUM | TRANSPORT) == 0 {
         return Ok((Checksum::Unverified, None));
     }
     let link = link.ok_or_else(|| invalid("a packet with offloads has to carry IPv4 or IPv6"))?;
@@ -83,14 +69,18 @@ pub(crate) fn describe(head: &[u8], data: &mut [u8], link: Option<usize>) -> io:
         let header = data.get_mut(link..transport).ok_or_else(|| invalid("the IPv4 header is cut off"))?;
         crate::packet::ipv4_header_checksum(header);
     }
-    if flags & (TCP_CSUM | UDP_CSUM | ICMP_CSUM | MSS) == 0 {
+    if flags & TRANSPORT == 0 {
         return Ok((Checksum::Unverified, None));
     }
     let offset = checksum_offset(protocol).ok_or_else(|| invalid("a checksum is left for a protocol without one"))?;
+    if flags & TRANSPORT & !flags_of(protocol) != 0 {
+        return Err(invalid("a checksum is left for another protocol than the packet's"));
+    }
     if transport + offset + 2 > data.len() {
         return Err(invalid("the checksum field lies outside the packet"));
     }
-    let checksum = Checksum::Partial { start: transport as u16, offset: offset as u16 };
+    let start = u16::try_from(transport).map_err(|_| invalid("the transport header starts past 64 KiB"))?;
+    let checksum = Checksum::Partial { start, offset: offset as u16 };
     if flags & MSS == 0 {
         return Ok((checksum, None));
     }
@@ -209,6 +199,54 @@ mod tests {
         packet[40] = TCP;
         packet[40 + 8 + 12] = 5 << 4;
         assert_eq!(transport_of(&packet, 0).unwrap(), (true, 48, TCP));
+    }
+
+    /// An IPv6 TCP packet behind a hop-by-hop options header of 16 bytes and a fragment header that
+    /// holds the whole packet, whose checksum is left to the reader.
+    fn behind_extension_headers(fragment: u16) -> Vec<u8> {
+        let flow = Flow::tcp(true);
+        let plain = flow.packet(1, &payload(4, 100));
+        let mut packet = plain[..40].to_vec();
+        packet[6] = 0;
+        // An option of a type to skip, with twelve bytes of data.
+        packet.extend_from_slice(&[44, 1, 0x1e, 12]);
+        packet.extend_from_slice(&[0xaa; 12]);
+        packet.extend_from_slice(&[TCP, 0]);
+        packet.extend_from_slice(&fragment.to_be_bytes());
+        packet.extend_from_slice(&[0, 0, 0, 7]);
+        packet.extend_from_slice(&plain[40..]);
+        let length = (packet.len() - 40) as u16;
+        packet[4..6].copy_from_slice(&length.to_be_bytes());
+        packet
+    }
+
+    #[test]
+    fn walks_past_a_long_header_in_front_of_a_fragment_header() {
+        let mut packet = behind_extension_headers(0);
+        assert_eq!(transport_of(&packet, 0).unwrap(), (true, 64, TCP));
+        let (checksum, gso) = describe(&head(TCP_CSUM, 0), &mut packet, Some(0)).unwrap();
+        assert_eq!((checksum, gso), (Checksum::Partial { start: 64, offset: TCP_CHECKSUM as u16 }, None));
+    }
+
+    #[test]
+    fn a_fragment_has_no_checksum_to_complete() {
+        // The first fragment of several, and one further on.
+        for fragment in [1, 8 << 3] {
+            let mut packet = behind_extension_headers(fragment);
+            assert!(describe(&head(TCP_CSUM, 0), &mut packet, Some(0)).is_err(), "fragment field {fragment:#x}");
+        }
+        let mut packet = Flow::udp(false).packet(1, &payload(2, 100));
+        packet[6] |= 0x20;
+        assert!(describe(&head(UDP_CSUM, 0), &mut packet, Some(0)).is_err(), "an IPv4 fragment");
+    }
+
+    #[test]
+    fn a_checksum_left_for_another_protocol_is_refused() {
+        let mut udp = Flow::udp(false).packet(1, &payload(2, 100));
+        assert!(describe(&head(TCP_CSUM, 0), &mut udp, Some(0)).is_err());
+        let mut tcp = Flow::tcp(false).packet(1, &payload(2, 100));
+        assert!(describe(&head(UDP_CSUM, 0), &mut tcp, Some(0)).is_err());
+        assert!(describe(&head(TCP_CSUM, 0), &mut tcp, Some(0)).is_ok());
     }
 
     #[test]
