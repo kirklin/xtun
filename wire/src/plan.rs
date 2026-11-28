@@ -18,8 +18,8 @@ use std::io;
 use crate::cut::{Cut, MAX_HEADER, complete_into, segment_header_len_head};
 use crate::framing::{Framing, Prefix};
 use crate::packet::{
-    ACK, Checksum, Gso, GsoKind, Head, PSH, Packet, Parts, Transport, each_in, first_byte, invalid, ipv4_header_checksum, link_len_head,
-    pseudo, write_u16,
+    ACK, Checksum, Gso, GsoKind, Head, PSH, Packet, Parts, TCP, Transport, UDP, each_in, first_byte, invalid, ipv4_header_checksum,
+    link_len_head, pseudo, write_u16,
 };
 use crate::tunhdr;
 use crate::vnet::{self, Header};
@@ -224,6 +224,10 @@ impl Plan {
         let carried = !claims || takes.carries(head, checksum, gso);
         if again && (link.is_none() || (joins && info.is_none()) || !carried) {
             return Ok(false);
+        }
+        // A packet whose flow is not read may be one of any flow: none joins a write before it.
+        if joins && info.is_none() && link.is_some_and(|link| may_be_of_a_flow(data, link)) {
+            self.table.forget();
         }
         let key = info.as_ref().map(|info| Key::new(data, info));
         if !carried {
@@ -448,6 +452,20 @@ impl Plan {
     }
 }
 
+/// Whether the IP packet at `link`, whose transport header was not read, may be one of a TCP or
+/// UDP flow: a fragment, or a packet behind IPv6 extension headers.
+fn may_be_of_a_flow(data: &[u8], link: usize) -> bool {
+    let Some(ip) = data.get(link..) else {
+        return false;
+    };
+    match ip.first().map(|byte| byte >> 4) {
+        Some(4) => ip.get(9).is_some_and(|protocol| matches!(*protocol, TCP | UDP)),
+        // TCP and UDP, and the extension headers that may come before them.
+        Some(6) => ip.get(6).is_some_and(|next| matches!(*next, TCP | UDP | 0 | 43 | 44 | 51 | 60 | 135 | 139 | 140)),
+        _ => false,
+    }
+}
+
 /// The first bytes of `packet`, up to [`MAX_HEADER`] of them, in one stretch, and how many
 /// they are.
 #[cold]
@@ -592,6 +610,11 @@ impl FlowTable {
             self.slots = vec![Slot::default(); size];
             self.generation = 0;
         }
+        self.forget();
+    }
+
+    /// Forgets every flow.
+    fn forget(&mut self) {
         self.generation = self.generation.wrapping_add(1);
         if self.generation == 0 {
             self.slots.fill(Slot::default());
@@ -873,6 +896,36 @@ mod tests {
             })
             .collect();
         assert_eq!(out, packets);
+    }
+
+    /// A packet of a flow whose transport header is not read, a fragment or one behind an IPv6
+    /// extension header, keeps its place among the packets of the flow around it.
+    #[test]
+    fn a_packet_whose_flow_is_not_read_keeps_its_place() {
+        let mut udp = Flow::udp(false);
+        let first = udp.packet(0, &payload(1, 100));
+        udp.id = 0x7777;
+        let mut fragment = udp.packet(0, &payload(2, 100));
+        fragment[6] |= 0x20;
+        ipv4_header_checksum(&mut fragment[..20]);
+        udp.id = Flow::udp(false).id.wrapping_add(1);
+        let last = udp.packet(0, &payload(3, 100));
+
+        let mut tcp = Flow::tcp(true);
+        let packets = tcp_run(&mut tcp, 7, &[1000; 3], 4);
+        let mut extended = packets[1][..40].to_vec();
+        extended[6] = 60;
+        extended.extend_from_slice(&[TCP, 0, 1, 4, 0, 0, 0, 0]);
+        extended.extend_from_slice(&packets[1][40..]);
+        let length = (extended.len() - 40) as u16;
+        extended[4..6].copy_from_slice(&length.to_be_bytes());
+
+        for flow in [[first, fragment, last], [packets[0].clone(), extended, packets[2].clone()]] {
+            let views: Vec<Packet<'_>> = flow.iter().map(|p| Packet::new(p).with_checksum(Checksum::Valid)).collect();
+            let plan = planned(&virtio(true, false), &views);
+            assert_eq!(counts(&plan), [1, 1, 1]);
+            assert_eq!(written(&plan, &views), flow);
+        }
     }
 
     #[test]
