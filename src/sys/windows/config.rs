@@ -357,6 +357,10 @@ pub(super) fn set_dns_servers(luid: &NET_LUID_LH, index: u32, servers: &[IpAddr]
     });
     for v6 in [false, true] {
         let list: Vec<IpAddr> = servers.iter().copied().filter(|server| server.is_ipv6() == v6).collect();
+        // An IP version that is not enabled on the adapter has no servers to clear.
+        if list.is_empty() && ip_interface(luid, if v6 { AF_INET6 } else { AF_INET }, Duration::ZERO)?.is_none() {
+            continue;
+        }
         match function {
             Some(function) => {
                 let joined: Vec<String> = list.iter().map(IpAddr::to_string).collect();
