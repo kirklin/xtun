@@ -451,7 +451,7 @@ pub struct ReaderStats {
 /// What a writer has done so far.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct WriterStats {
-    /// Packets handed in.
+    /// Packets handed in and taken: a call that refuses its packets counts none of them.
     pub packets: u64,
     /// Writes the device took: a segment joined from many packets counts once.
     pub writes: u64,
@@ -818,15 +818,15 @@ impl<L: Layer> Writer<L> {
 
     /// Writes what the device takes now and keeps the rest. Nothing waits from before.
     fn put(&mut self, packets: &[Packet<'_>]) -> io::Result<()> {
-        self.stats.packets += packets.len() as u64;
         self.plan.plan(&self.sink.takes(), packets)?;
+        self.stats.packets += packets.len() as u64;
         self.put_planned(packets)
     }
 
     /// [`Writer::put`] for packets in pieces.
     fn put_pieces<B: AsRef<[u8]>>(&mut self, packets: &[Pieces<'_, B>]) -> io::Result<()> {
-        self.stats.packets += packets.len() as u64;
         self.plan.plan_parts(&self.sink.takes(), packets)?;
+        self.stats.packets += packets.len() as u64;
         self.put_planned(packets)
     }
 
