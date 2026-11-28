@@ -12,7 +12,7 @@ use xtun_wire::{Framing, Prefix, Takes};
 
 use super::sys::*;
 use super::{Interface, io, one_queue};
-use crate::device::{Offload, Options};
+use crate::device::{Offload, Options, Up};
 use crate::sys::bsdlike::{ioctl, request, tolerate};
 use crate::sys::unix::transport::{Facts, Sink, Source};
 use crate::sys::unix::{Queue, copy_name, read_name};
@@ -109,6 +109,23 @@ impl crate::sys::Tunnel for Tap {
         self.pair.persist.store(persist, Ordering::Relaxed);
         if !persist {
             self.pair.released.store(true, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Makes the second interface carry what the first one does when the first was there before
+    /// the device: a frame crosses the pair only while both are up, and the second interface
+    /// sends no frame larger than its own MTU. It takes the MTU of the first unless the builder
+    /// names one, and comes up beside a first that is left up.
+    fn prepare(&self, options: &Options) -> Result<()> {
+        if options.mtu.is_none() {
+            let mtu = self.interface.mtu()?;
+            if self.peer.mtu()? != mtu {
+                self.peer.set_mtu(mtu)?;
+            }
+        }
+        if options.up == Up::Unchanged && self.interface.is_up()? {
+            self.peer.set_up(true)?;
         }
         Ok(())
     }

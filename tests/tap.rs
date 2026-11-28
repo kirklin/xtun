@@ -308,6 +308,54 @@ fn a_persistent_device_stays_and_is_taken_over() {
     assert!(!exists(&name), "told it may go, the interface goes with the device");
 }
 
+/// A `feth` interface that was there without a second one gets a new one that carries what it
+/// does: at its MTU, and up beside it when the builder leaves it up.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "creates interfaces: run as root with --ignored"]
+fn a_feth_interface_that_was_there_gets_a_second_one_that_carries_its_frames() {
+    let (name, second) = ("feth940", "feth941");
+    let ifconfig = |args: &[&str]| {
+        let output = Command::new("ifconfig").args(args).output().unwrap();
+        assert!(output.status.success(), "ifconfig {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+        String::from_utf8(output.stdout).unwrap()
+    };
+    ifconfig(&[name, "create"]);
+    ifconfig(&[name, "mtu", "2000", "up"]);
+    let (device, queues) =
+        Tap::builder().name(name).peer_name(second).mac_address(DEVICE_MAC).keep_up_state().address(net("10.99.0.1/24")).build().unwrap();
+    assert!(device.is_up().unwrap(), "the interface is left up");
+    assert_eq!(device.mtu().unwrap(), 2000, "the interface keeps its MTU");
+    let state = ifconfig(&[second]);
+    assert!(state.contains("<UP,") && state.contains("mtu 2000"), "the second interface: {state}");
+    neighbors(&device, &["10.99.0.2"]);
+    let (mut reader, mut writer) = ends(queues);
+    let socket = std::net::UdpSocket::bind(SocketAddr::new(ip("10.99.0.1"), 0)).unwrap();
+    socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let port = socket.local_addr().unwrap().port();
+    // What the system sends crosses the pair to the reader.
+    socket.send_to(b"across the pair", SocketAddr::new(ip("10.99.0.2"), 9)).unwrap();
+    reader.set_timeout(Some(Duration::from_secs(5)));
+    let mut frame = [0u8; 2048];
+    loop {
+        let length = reader.blocking_recv_packet(&mut frame).unwrap();
+        if frame[..length].ends_with(b"across the pair") {
+            break;
+        }
+    }
+    // A frame as large as the MTU of the first interface goes out through the second.
+    let payload = vec![0x5a; 2000 - 28];
+    let reply = Build { src: ip("10.99.0.2"), dst: ip("10.99.0.1"), src_port: 9, dst_port: port, ttl: 64, id: 1 }.udp(&payload);
+    writer.blocking_send(&[Packet::new(&ethernet(DEVICE_MAC, NEIGHBOR_MAC, &reply)).with_checksum(Checksum::Valid)]).unwrap();
+    assert_eq!(writer.stats().dropped, 0);
+    let mut received = vec![0u8; 4096];
+    let (size, _) = socket.recv_from(&mut received).unwrap();
+    assert_eq!(received[..size], payload[..]);
+    device.set_persist(false).unwrap();
+    drop((device, reader, writer));
+    assert!(!exists(name) && !exists(second), "told they may go, both interfaces go with the device");
+}
+
 /// FreeBSD renames interfaces: a descriptor is known for what it is by its device.
 #[cfg(target_os = "freebsd")]
 #[test]
