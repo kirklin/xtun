@@ -818,9 +818,9 @@ fn route(kind: u8, index: u32, net: IpNet, via: Option<IpAddr>) -> Result<()> {
     let host = net.prefix_len() == net.max_prefix_len();
     let mut body = Vec::new();
     let mut addresses = RTA_DST | RTA_GATEWAY;
-    push_ip(&mut body, net.addr());
+    push_scoped(&mut body, net.addr(), index);
     match via {
-        Some(via) => push_ip(&mut body, via),
+        Some(via) => push_scoped(&mut body, via, index),
         None => push_link(&mut body, index),
     }
     if !host {
@@ -883,6 +883,22 @@ fn push_ip(body: &mut Vec<u8>, ip: IpAddr) {
     match ip {
         IpAddr::V4(ip) => push_sockaddr(body, &sockaddr_v4(ip)),
         IpAddr::V6(ip) => push_sockaddr(body, &sockaddr_v6(ip)),
+    }
+}
+
+/// Appends `ip`, an address on the link of the interface `index` if it is link-local. The KAME
+/// stacks of the BSDs and the Apple systems take the interface of such an address in its third
+/// and fourth bytes, as their own `route` writes it, and some in its scope as well.
+fn push_scoped(body: &mut Vec<u8>, ip: IpAddr, index: u32) {
+    match ip {
+        IpAddr::V6(v6) if v6.is_unicast_link_local() || (v6.is_multicast() && v6.octets()[1] & 0x0f == 2) => {
+            let mut octets = v6.octets();
+            octets[2..4].copy_from_slice(&(index as u16).to_be_bytes());
+            let mut address = sockaddr_v6(Ipv6Addr::from(octets));
+            address.sin6_scope_id = index;
+            push_sockaddr(body, &address);
+        }
+        other => push_ip(body, other),
     }
 }
 
