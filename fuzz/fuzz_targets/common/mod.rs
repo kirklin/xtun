@@ -3,7 +3,11 @@
 
 #![allow(dead_code)]
 
+use xtun_wire::checksum::Sum;
 use xtun_wire::{Checksum, Frame, Framing, Gso, GsoKind, Parts, Plan, Prefix, Takes, VIRTIO_HEADER, Writes, gather};
+
+/// `TUN_H_TCP_MSS` of OpenBSD's `tun_hdr`: the packet is a TCP segment to cut.
+const TUN_H_TCP_MSS: u16 = 1 << 5;
 
 /// The framing of a Linux tun device with offloads.
 pub const VIRTIO: Framing = Framing { prefix: Prefix::Virtio(VIRTIO_HEADER), ethernet: false };
@@ -39,9 +43,30 @@ pub fn plan_and_read<P: Parts>(takes: &Takes, packets: &[P]) -> Option<Vec<Vec<u
     let mut write = Vec::new();
     for index in 0..writes.count() {
         gather(&writes, index, &mut write);
+        handed_back(takes.framing, &mut write);
         out.extend(read(takes.framing, &write).expect("the writer plans only what the device accepts"));
     }
     Some(out)
+}
+
+/// Turns a write into what the device hands over for it. OpenBSD fills in the checksum field of
+/// a TCP segment it takes itself, and hands one over with the pseudo header in that field
+/// without the length, which a read adds.
+fn handed_back(framing: Framing, write: &mut [u8]) {
+    let Prefix::TunHdr { family } = framing.prefix else {
+        return;
+    };
+    assert!(family.is_some() && !framing.ethernet, "the targets plan for OpenBSD's tun devices only");
+    if u16::from_ne_bytes([write[0], write[1]]) & TUN_H_TCP_MSS == 0 {
+        return;
+    }
+    // A segment the writer hands over has no IPv6 extension headers.
+    let packet = &mut write[framing.prefix.len()..];
+    let transport = if packet[0] >> 4 == 6 { 40 } else { usize::from(packet[0] & 0x0f) * 4 };
+    let (at, length) = (transport + 16, packet.len() - transport);
+    let field = u16::from_be_bytes([packet[at], packet[at + 1]]);
+    let without = Sum::ZERO.word(field).word(!(length as u16)).fold();
+    packet[at..at + 2].copy_from_slice(&without.to_be_bytes());
 }
 
 /// The checksum state and segmentation a caller could claim for a packet, from two bytes.
