@@ -757,7 +757,11 @@ fn hands_over_its_descriptor() {
     let (device, queue) = device.into_fd(queue).unwrap_err();
     assert_eq!(queue.index(), 0);
     drop(handle);
+    // The queue of another device is given back as it was: no queue of this device comes of it.
+    let (other, mut others) = builder("xtuntest22").build().unwrap();
+    let (device, foreign) = device.into_fd(others.remove(0)).unwrap_err();
     let fd = device.into_fd(queue).unwrap();
+    drop((other, foreign));
     let (device, queue) = match Tun::from_fd(fd) {
         Ok(adopted) => adopted,
         // The tun driver OmniOS ships is older than the request that tells a descriptor's unit.

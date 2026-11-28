@@ -669,9 +669,13 @@ where
 
     /// The descriptor of a device with one queue, for something else to use, in exchange for
     /// the device and its queue. Fails, giving both back, while other handles of the device
-    /// exist. NetBSD keeps the interface after the descriptor is closed; a device that
-    /// [`Device::from_fd`] made of it removes it once told [`Device::set_persist`]`(false)`.
+    /// exist or when the queue is another device's. NetBSD keeps the interface after the
+    /// descriptor is closed; a device that [`Device::from_fd`] made of it removes it once told
+    /// [`Device::set_persist`]`(false)`.
     pub fn into_fd(self, queue: Queue<L>) -> Result<std::os::fd::OwnedFd, (Device<L>, Queue<L>)> {
+        if !Arc::ptr_eq(&self.tunnel, &queue.tunnel) {
+            return Err((self, queue));
+        }
         let Device { tunnel, prefix_routes } = self;
         let Queue { tunnel: queued, index } = queue;
         drop(queued);
