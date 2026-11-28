@@ -58,12 +58,16 @@ impl Takes {
         }
         match self.framing.prefix {
             Prefix::None | Prefix::Family(_) => false,
-            Prefix::Virtio(_) => match gso.map(|gso| gso.kind) {
+            Prefix::Virtio(_) => match gso {
                 None => true,
-                Some(GsoKind::Tcp4 { .. } | GsoKind::Tcp6 { .. }) => self.tcp,
-                Some(GsoKind::Udp) => self.udp,
+                Some(Gso { kind: GsoKind::Tcp4 { .. } | GsoKind::Tcp6 { .. }, .. }) => self.tcp,
+                // The system refuses a UDP segment of more datagrams than its limit.
+                Some(gso @ Gso { kind: GsoKind::Udp, .. }) => {
+                    let datagrams = (head.len - usize::from(gso.header_len)).div_ceil(usize::from(gso.segment_size));
+                    self.udp && datagrams <= self.udp_max_segments
+                }
             },
-            Prefix::TunHdr { .. } => tunhdr::describes(head, checksum, gso, self.framing.ethernet),
+            Prefix::TunHdr { .. } => (gso.is_none() || self.tcp) && tunhdr::describes(head, checksum, gso, self.framing.ethernet),
         }
     }
 }
@@ -1060,6 +1064,24 @@ mod tests {
         let carried = planned(&virtio(true, false), &views);
         assert_eq!(Header::read(&write(&carried, &views, 1)).gso_type, vnet::GSO_UDP_L4);
         assert_eq!(written(&carried, &views).len(), out.len());
+    }
+
+    /// A segment the device is not told about is cut here: a UDP segment of more datagrams than
+    /// the system's limit, and a TCP segment for a device that takes none.
+    #[test]
+    fn segments_beyond_what_the_device_takes_are_cut_here() {
+        let (udp, udp_checksum, udp_gso, datagrams) = segment(&Flow::udp(false), 100, 100 * 65);
+        let views = [Packet::new(&udp).with_checksum(udp_checksum).with_gso(udp_gso)];
+        let plan = planned(&virtio(true, false), &views);
+        assert_eq!(plan.writes.len(), 65, "a UDP segment of 65 datagrams for a limit of 64");
+        assert_eq!(written(&plan, &views), datagrams);
+        let (tcp, tcp_checksum, tcp_gso, packets) = segment(&Flow::tcp(false), 1400, 4000);
+        let views = [Packet::new(&tcp).with_checksum(tcp_checksum).with_gso(tcp_gso)];
+        let plan = planned(&takes(Prefix::TunHdr { family: Some(BSD) }, false, false, false), &views);
+        assert_eq!(plan.writes.len(), packets.len(), "a device with a tun_hdr that takes no TCP segments");
+        for (index, packet) in packets.iter().enumerate() {
+            assert_eq!(write(&plan, &views, index)[12..], packet[..]);
+        }
     }
 
     #[test]
