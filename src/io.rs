@@ -63,7 +63,8 @@ impl Loan {
     pub fn new(raw: &mut [u8], decoded: Decoded, block: Option<&Arc<Block>>) -> Loan {
         let frame = &mut raw[decoded.start..decoded.start + decoded.len];
         let data = NonNull::from(frame).cast();
-        let block = block.map(|block| NonNull::from(&**block));
+        // The pointer of the `Arc` itself, which reaches its counts, as `Arc::from_raw` needs.
+        let block = block.map(|block| NonNull::new(Arc::as_ptr(block).cast_mut()).expect("an Arc is never null"));
         Loan { data, len: decoded.len, link: decoded.link, checksum: decoded.checksum, gso: decoded.gso, block, taken: false }
     }
 
@@ -1124,6 +1125,24 @@ mod tests {
     fn an_owned_frame_goes_to_any_thread() {
         fn anywhere<T: Send + Sync + 'static>() {}
         anywhere::<OwnedFrame>();
+    }
+
+    #[test]
+    fn a_frame_taken_out_keeps_its_block_after_the_reader_let_go() {
+        let (pool, mut blocks) = crate::block::Pool::new(64, 1).unwrap();
+        let block = blocks.remove(0);
+        // SAFETY: the block is held alone, and nothing else refers to its memory.
+        let raw = unsafe { std::slice::from_raw_parts_mut(block.start().as_ptr(), block.len()) };
+        raw[..4].copy_from_slice(b"abcd");
+        let decoded = Decoded { start: 0, len: 4, link: 0, checksum: Checksum::Unverified, gso: None };
+        let mut loan = Loan::new(raw, decoded, Some(&block));
+        // SAFETY: the frame was just lent, and nothing else refers to its bytes.
+        let bytes = unsafe { loan.bytes() };
+        let frame = LentFrame { frame: Frame::trusted(bytes, 0, Checksum::Unverified, None), loan: &mut loan };
+        let owned = frame.into_owned();
+        drop((block, blocks, pool));
+        assert_eq!(owned.data(), b"abcd");
+        drop(owned);
     }
 
     #[test]
