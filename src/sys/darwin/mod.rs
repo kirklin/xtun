@@ -144,20 +144,26 @@ impl Tun {
     pub fn packet_tunnel() -> Result<Tun> {
         // SAFETY: plain query of the descriptor table's size.
         let limit = unsafe { libc::getdtablesize() }.max(0);
+        // The id of the utun control, which a control socket of the process tells: a provider may
+        // not be allowed a socket of its own to ask with. A socket that does not tell, or that
+        // another thread closes meanwhile, is passed over.
+        let mut utun = None;
+        let mut refused = None;
         for fd in 0..limit {
-            // SAFETY: plain old data.
-            let mut address: sockaddr_ctl = unsafe { zeroed() };
-            let mut length = size_of::<sockaddr_ctl>() as libc::socklen_t;
-            // SAFETY: `address` is writable for `length` bytes; a descriptor that is not a socket fails.
-            if unsafe { libc::getpeername(fd, (&raw mut address).cast(), &mut length) } < 0 {
+            let Some(peer) = peer_control(fd) else {
                 continue;
-            }
-            if i32::from(address.sc_family) != AF_SYSTEM || address.ss_sysaddr != AF_SYS_CONTROL {
-                continue;
-            }
-            // The control socket itself tells the id of the utun control: a provider may not be
-            // allowed a socket of its own to ask with.
-            if control_id(fd)? != address.sc_id {
+            };
+            let id = match utun {
+                Some(id) => id,
+                None => match control_id(fd) {
+                    Ok(id) => *utun.insert(id),
+                    Err(error) => {
+                        refused = Some(error);
+                        continue;
+                    }
+                },
+            };
+            if id != peer {
                 continue;
             }
             // SAFETY: duplicates a descriptor of this process; the duplicate is owned right away.
@@ -168,7 +174,10 @@ impl Tun {
             // SAFETY: `copy` is new and owned by nobody else.
             return Tun::wrap(unsafe { OwnedFd::from_raw_fd(copy) });
         }
-        Err(Error::new(ErrorKind::NotFound, "the process has no utun interface"))
+        Err(match refused.filter(|_| utun.is_none()) {
+            Some(error) => Error::new(error.kind(), format!("no control socket of the process tells the id of the utun control: {error}")),
+            None => Error::new(ErrorKind::NotFound, "the process has no utun interface"),
+        })
     }
 
     /// Sets whether packets pass with the address family in front, from the next read and
@@ -178,11 +187,20 @@ impl Tun {
         Ok(())
     }
 
-    /// Wraps the control socket of a utun interface.
+    /// Wraps the control socket of a utun interface. Its flags, which every duplicate of the
+    /// socket shares, change only once it is known to be one.
     fn wrap(fd: OwnedFd) -> Result<Tun> {
+        let utun = match peer_control(fd.as_raw_fd()) {
+            Some(peer) => control_id(fd.as_raw_fd())? == peer,
+            None => false,
+        };
+        if !utun {
+            return Err(Error::new(ErrorKind::InvalidInput, "the descriptor is not a utun interface"));
+        }
+        let name = interface_name(fd.as_raw_fd())?;
         set_nonblocking(fd.as_raw_fd())?;
         set_cloexec(fd.as_raw_fd())?;
-        let interface = Interface::new(&interface_name(fd.as_raw_fd())?, false)?;
+        let interface = Interface::new(&name, false)?;
         tune(fd.as_raw_fd(), interface.mtu()? as usize)?;
         Ok(Tun { interface, queue: Arc::new(Queue::new(fd)), packet_information: AtomicBool::new(false) })
     }
@@ -198,6 +216,18 @@ fn one_queue(only: &Arc<Queue>, queue: usize) -> Result<&Arc<Queue>> {
         return Err(Error::new(ErrorKind::InvalidInput, format!("the device has one queue, there is no queue {queue}")));
     }
     Ok(only)
+}
+
+/// The id of the kernel control that `fd` is connected to, if it is a kernel control socket.
+fn peer_control(fd: RawFd) -> Option<u32> {
+    // SAFETY: plain old data.
+    let mut address: sockaddr_ctl = unsafe { zeroed() };
+    let mut length = size_of::<sockaddr_ctl>() as libc::socklen_t;
+    // SAFETY: `address` is writable for `length` bytes; a descriptor that is not a socket fails.
+    if unsafe { libc::getpeername(fd, (&raw mut address).cast(), &mut length) } < 0 {
+        return None;
+    }
+    (i32::from(address.sc_family) == AF_SYSTEM && address.ss_sysaddr == AF_SYS_CONTROL).then_some(address.sc_id)
 }
 
 /// The id of the utun kernel control, asked through the kernel control socket `fd`.
@@ -281,4 +311,24 @@ fn setsockopt(fd: RawFd, level: libc::c_int, option: libc::c_int, value: libc::c
         libc::setsockopt(fd, level, option, (&raw const value).cast(), size_of::<libc::c_int>() as libc::socklen_t)
     };
     if set < 0 { Err(Error::last_os_error()) } else { Ok(()) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A descriptor that is no utun socket is refused before anything changes the flags that
+    /// its duplicates share.
+    #[test]
+    fn a_descriptor_that_is_no_utun_socket_keeps_its_flags() {
+        let (ours, _theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        let blocking = |fd: RawFd| {
+            // SAFETY: F_GETFL takes no argument.
+            unsafe { libc::fcntl(fd, libc::F_GETFL) & libc::O_NONBLOCK == 0 }
+        };
+        assert!(blocking(ours.as_raw_fd()));
+        let duplicate = OwnedFd::from(ours.try_clone().unwrap());
+        assert!(Tun::wrap(duplicate).is_err());
+        assert!(blocking(ours.as_raw_fd()), "the socket still blocks");
+    }
 }
