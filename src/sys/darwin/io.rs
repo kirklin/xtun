@@ -327,7 +327,7 @@ mod tests {
         assert!(writer.calls <= 5, "one call takes many messages");
 
         let mut reads = MessageReads::default();
-        let mut slots = Slots::new(8);
+        let mut slots = Slots::new(8).unwrap();
         let mut reader = ReaderStats::default();
         // A batch of two slots is filled and says that the socket may hold more.
         let (found, filled) = read(&mut reads, &far, &mut slots, 2, &mut reader);
@@ -376,7 +376,7 @@ mod tests {
         let list = Pieces(vec![vec![vec![0x45; 20]]]);
         let error = MessageWrites::default().write(-1, &list, &mut WriterStats::default()).unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::EBADF));
-        let filled = MessageReads::default().read(-1, &mut Slots::new(1), 1, &mut ReaderStats::default(), |_| panic!("nothing was read"));
+        let filled = MessageReads::default().read(-1, &mut Slots::new(1).unwrap(), 1, &mut ReaderStats::default(), |_| panic!("nothing was read"));
         assert_eq!(filled.error.and_then(|error| error.raw_os_error()), Some(libc::EBADF));
     }
 
@@ -403,7 +403,7 @@ mod tests {
         buffer.truncate(buffer.len() - 2);
         let held = 0..buffer.len();
         let mut reads = BpfReads { buffer: buffer.into_boxed_slice(), held };
-        let (mut slots, mut stats) = (Slots::new(0), ReaderStats::default());
+        let (mut slots, mut stats) = (Slots::new(0).unwrap(), ReaderStats::default());
         // No descriptor is read while records of the last read are held.
         let mut found = Vec::new();
         let mut keep = |raw: Found<'_>| {

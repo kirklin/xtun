@@ -80,7 +80,7 @@ impl super::Tunnel for Tun {
     }
 
     fn source(self: &Arc<Tun>, queue: usize, frames: usize) -> Result<Self::Source> {
-        Ok(Source::new(self.clone(), self.queue(queue)?, io::MessageReads::default(), frames))
+        Source::new(self.clone(), self.queue(queue)?, io::MessageReads::default(), frames)
     }
 
     fn sink(self: &Arc<Tun>, queue: usize) -> Result<Self::Sink> {

@@ -172,7 +172,7 @@ impl super::Tunnel for Tunnel {
     }
 
     fn source(self: &Arc<Tunnel>, queue: usize, frames: usize) -> Result<Self::Source> {
-        Ok(Source::new(self.clone(), self.queue(queue)?, Each, frames))
+        Source::new(self.clone(), self.queue(queue)?, Each, frames)
     }
 
     fn sink(self: &Arc<Tunnel>, queue: usize) -> Result<Self::Sink> {

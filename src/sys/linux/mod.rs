@@ -120,7 +120,7 @@ impl super::Tunnel for Tunnel {
 
     fn source(self: &Arc<Tunnel>, queue: usize, frames: usize) -> Result<Self::Source> {
         let reads = uring::Reads::new(self.uring, frames)?;
-        Ok(Source::new(self.clone(), &self.queue(queue)?, reads, frames))
+        Source::new(self.clone(), &self.queue(queue)?, reads, frames)
     }
 
     fn sink(self: &Arc<Tunnel>, queue: usize) -> Result<Self::Sink> {

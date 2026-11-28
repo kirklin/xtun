@@ -85,7 +85,7 @@ impl crate::sys::Tunnel for Tap {
 
     fn source(self: &Arc<Tap>, queue: usize, frames: usize) -> Result<Self::Source> {
         let queue = one_queue(&self.queue, queue)?;
-        Ok(Source::new(self.clone(), queue, io::BpfReads::new(queue.raw_fd())?, frames))
+        Source::new(self.clone(), queue, io::BpfReads::new(queue.raw_fd())?, frames)
     }
 
     fn sink(self: &Arc<Tap>, queue: usize) -> Result<Self::Sink> {

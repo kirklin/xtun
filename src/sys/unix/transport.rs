@@ -29,9 +29,9 @@ pub struct Slots {
 
 impl Slots {
     /// `count` slots.
-    pub fn new(count: usize) -> Slots {
-        let (pool, blocks) = Pool::new(SLOT, count);
-        Slots { blocks, lent: vec![false; count], pool }
+    pub fn new(count: usize) -> io::Result<Slots> {
+        let (pool, blocks) = Pool::new(SLOT, count)?;
+        Ok(Slots { blocks, lent: vec![false; count], pool })
     }
 
     /// The room of slot `index`, for the device to fill.
@@ -113,9 +113,9 @@ pub struct Source<T: Facts, R: Read> {
 }
 
 impl<T: Facts, R: Read> Source<T, R> {
-    pub(crate) fn new(tunnel: Arc<T>, queue: &Arc<Queue>, reads: R, frames: usize) -> Source<T, R> {
-        let slots = Slots::new(reads.slots(frames));
-        Source { reads, slots, frames, port: Port::new(queue.clone(), false), tunnel }
+    pub(crate) fn new(tunnel: Arc<T>, queue: &Arc<Queue>, reads: R, frames: usize) -> io::Result<Source<T, R>> {
+        let slots = Slots::new(reads.slots(frames))?;
+        Ok(Source { reads, slots, frames, port: Port::new(queue.clone(), false), tunnel })
     }
 }
 
@@ -349,7 +349,7 @@ mod tests {
 
     #[test]
     fn a_slot_whose_frame_was_taken_gets_another_block() {
-        let mut slots = Slots::new(2);
+        let mut slots = Slots::new(2).unwrap();
         let first = slots.room(0).as_mut_ptr();
         slots.room(0)[..3].copy_from_slice(b"abc");
         let found = slots.filled(0, 3);
@@ -374,7 +374,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "a slot is filled once")]
     fn a_slot_is_not_lent_twice() {
-        let mut slots = Slots::new(1);
+        let mut slots = Slots::new(1).unwrap();
         slots.filled(0, 1);
         slots.filled(0, 1);
     }

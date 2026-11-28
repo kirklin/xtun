@@ -8,6 +8,7 @@
 //! them; the reader's blocks come from there for as long as frames give theirs back. Blocks
 //! beyond those are allocated one by one.
 
+use std::io;
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -63,14 +64,18 @@ pub struct Pool {
 
 impl Pool {
     /// A pool of blocks of `size` bytes, and its first `count` blocks, which lie side by side.
-    /// The pool keeps up to `count` further blocks while they are free.
-    pub fn new(size: usize, count: usize) -> (Arc<Pool>, Vec<Arc<Block>>) {
-        let first = Memory::new(size * count);
+    /// The pool keeps up to `count` further blocks while they are free. Fails when the blocks
+    /// together are larger than an allocation can be.
+    pub fn new(size: usize, count: usize) -> io::Result<(Arc<Pool>, Vec<Arc<Block>>)> {
+        let total = size.checked_mul(count).filter(|total| isize::try_from(*total).is_ok()).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, format!("{count} blocks of {size} bytes are larger than an allocation can be"))
+        })?;
+        let first = Memory::new(total);
         let start = first.start();
         let pool = Arc::new(Pool { size, _first: first, keep: count, free: Mutex::new(Free::default()) });
         // SAFETY: block `index` starts inside the allocation of `count` blocks.
         let blocks = (0..count).map(|index| Arc::new(Block { start: unsafe { start.add(index * size) }, more: None, pool: pool.clone() }));
-        (pool.clone(), blocks.collect())
+        Ok((pool.clone(), blocks.collect()))
     }
 
     /// A block that nothing else holds: one of the first allocation if one is free, one that
@@ -139,7 +144,7 @@ mod tests {
 
     #[test]
     fn the_first_blocks_lie_side_by_side_and_come_out_again_first() {
-        let (pool, mut blocks) = Pool::new(4096, 2);
+        let (pool, mut blocks) = Pool::new(4096, 2).unwrap();
         assert_eq!((blocks.len(), blocks[0].len()), (2, 4096));
         // SAFETY: both blocks start inside the pool's first allocation.
         assert_eq!(unsafe { blocks[0].start().add(4096) }, blocks[1].start());
@@ -165,7 +170,7 @@ mod tests {
 
     #[test]
     fn a_pool_without_first_blocks_hands_out_blocks() {
-        let (pool, blocks) = Pool::new(64, 0);
+        let (pool, blocks) = Pool::new(64, 0).unwrap();
         assert!(blocks.is_empty());
         let block = pool.block();
         // SAFETY: the block is held alone.
@@ -175,8 +180,14 @@ mod tests {
     }
 
     #[test]
+    fn a_pool_too_large_for_memory_is_refused() {
+        let error = Pool::new(65_664, usize::MAX / 65_664 + 1).err().expect("the size overflows");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
     fn a_block_outlives_what_made_it() {
-        let (pool, mut blocks) = Pool::new(64, 4);
+        let (pool, mut blocks) = Pool::new(64, 4).unwrap();
         let block = blocks.remove(2);
         drop((pool, blocks));
         // SAFETY: the block is held alone, and keeps the pool's first allocation alive.
