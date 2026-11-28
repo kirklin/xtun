@@ -11,6 +11,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 use xtun_wire::Writes as List;
 
 use super::sys::{msghdr_x, recvmsg_x, sendmsg_x};
+#[cfg(target_os = "macos")]
+use crate::block::Memory;
 use crate::io::{Filled, ReaderStats, WriterStats};
 use crate::sys::unix::transport::{Found, IoVecs, Read, Slots, Write, Wrote, retry, wrote};
 
@@ -179,8 +181,8 @@ fn send(fd: RawFd, headers: &[msghdr_x], stats: &mut WriterStats) -> Result<usiz
 #[cfg(target_os = "macos")]
 pub struct BpfReads {
     /// As large as the device's buffer, which a read has to offer. The frames of a read lie
-    /// here side by side.
-    buffer: Box<[u8]>,
+    /// here side by side, each lent as a stretch of its own.
+    buffer: Memory,
     /// The records of the last read that no batch had room for.
     held: Range<usize>,
 }
@@ -193,7 +195,7 @@ impl BpfReads {
         if unsafe { libc::ioctl(fd, super::sys::BIOCGBLEN, &mut size) } < 0 {
             return Err(std::io::Error::last_os_error());
         }
-        Ok(BpfReads { buffer: vec![0u8; size as usize].into_boxed_slice(), held: 0..0 })
+        Ok(BpfReads { buffer: Memory::new(size as usize), held: 0..0 })
     }
 }
 
@@ -205,11 +207,11 @@ impl Read for BpfReads {
 
     fn read(&mut self, fd: RawFd, _slots: &mut Slots, frames: usize, stats: &mut ReaderStats, mut frame: impl FnMut(Found<'_>)) -> Filled {
         use super::sys::{BPF_ALIGNMENT, bpf_hdr};
-        let buffer = &mut self.buffer[..];
+        let (base, size) = (self.buffer.start().as_ptr(), self.buffer.len());
         if self.held.is_empty() {
             stats.calls += 1;
-            // SAFETY: `buffer` is writable for its whole length.
-            match retry(|| unsafe { libc::read(fd, buffer.as_mut_ptr().cast(), buffer.len()) }) {
+            // SAFETY: the buffer is writable for its whole length, and no frame of it is lent.
+            match retry(|| unsafe { libc::read(fd, base.cast(), size) }) {
                 Ok(0) => return Filled::dry(),
                 Ok(read) => self.held = 0..read,
                 Err(error) if error.kind() == ErrorKind::WouldBlock => return Filled::dry(),
@@ -220,7 +222,7 @@ impl Read for BpfReads {
         while handed < frames && self.held.len() >= size_of::<bpf_hdr>() {
             // SAFETY: a record header lies at the start of what is held, inside what was read;
             // it may be unaligned.
-            let header = unsafe { std::ptr::read_unaligned(buffer[self.held.start..].as_ptr().cast::<bpf_hdr>()) };
+            let header = unsafe { std::ptr::read_unaligned(base.add(self.held.start).cast::<bpf_hdr>()) };
             let (start, len) = (self.held.start + usize::from(header.bh_hdrlen), header.bh_caplen as usize);
             let next = (start + len).next_multiple_of(BPF_ALIGNMENT);
             if start + len > self.held.end || next <= self.held.start {
@@ -230,7 +232,9 @@ impl Read for BpfReads {
             }
             self.held.start = next.min(self.held.end);
             if len > 0 && header.bh_caplen == header.bh_datalen {
-                frame(Found { bytes: &mut buffer[start..start + len], block: None });
+                // SAFETY: the frame lies inside what was read, apart from every other frame.
+                let bytes = unsafe { std::slice::from_raw_parts_mut(base.add(start), len) };
+                frame(Found { bytes, block: None });
                 handed += 1;
             } else {
                 stats.malformed += 1;
@@ -393,6 +397,15 @@ mod tests {
         record
     }
 
+    /// A reader of a BPF device that holds `bytes`, as if a read had just put them there.
+    #[cfg(target_os = "macos")]
+    fn holding(bytes: &[u8]) -> BpfReads {
+        let buffer = Memory::new(bytes.len());
+        // SAFETY: the memory is new and as long as the bytes.
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.start().as_ptr(), bytes.len()) };
+        BpfReads { buffer, held: 0..bytes.len() }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn the_records_of_a_bpf_read_are_handed_out_a_batch_at_a_time() {
@@ -401,8 +414,7 @@ mod tests {
         // without its padding.
         let mut buffer: Vec<u8> = [record(&frames[0], 60), record(&frames[1][..20], 62), record(&frames[2], 64)].concat();
         buffer.truncate(buffer.len() - 2);
-        let held = 0..buffer.len();
-        let mut reads = BpfReads { buffer: buffer.into_boxed_slice(), held };
+        let mut reads = holding(&buffer);
         let (mut slots, mut stats) = (Slots::new(0).unwrap(), ReaderStats::default());
         // No descriptor is read while records of the last read are held.
         let mut found = Vec::new();
@@ -420,5 +432,26 @@ mod tests {
         let filled = reads.read(-1, &mut slots, 4, &mut stats, |_| panic!("nothing was read"));
         assert_eq!(filled.error.and_then(|error| error.raw_os_error()), Some(libc::EBADF));
         assert_eq!(stats.calls, 1);
+    }
+
+    /// The frames of one read are lent together, and stay lent while the reader moves.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_frames_of_a_bpf_read_stay_valid_together_and_where_the_reader_moves() {
+        let frames: Vec<Vec<u8>> = (0..3u8).map(|number| vec![number; 60 + usize::from(number)]).collect();
+        let bytes: Vec<u8> = frames.iter().flat_map(|frame| record(frame, frame.len())).collect();
+        let mut reads = holding(&bytes);
+        let (mut slots, mut stats) = (Slots::new(0).unwrap(), ReaderStats::default());
+        let mut lent = Vec::new();
+        reads.read(-1, &mut slots, 4, &mut stats, |found| lent.push((found.bytes.as_mut_ptr(), found.bytes.len())));
+        let reads = std::hint::black_box(reads);
+        for ((data, len), frame) in lent.iter().zip(&frames) {
+            // SAFETY: the reader has not read again since it lent the frames.
+            let bytes = unsafe { std::slice::from_raw_parts_mut(*data, *len) };
+            bytes[0] ^= 0xff;
+            bytes[0] ^= 0xff;
+            assert_eq!(bytes, &frame[..]);
+        }
+        drop(reads);
     }
 }

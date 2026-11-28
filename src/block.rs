@@ -12,8 +12,10 @@ use std::io;
 use std::ptr::NonNull;
 use std::sync::{Arc, Mutex, PoisonError};
 
-/// Zeroed memory from the allocator, freed when it is dropped.
-struct Memory(NonNull<[u8]>);
+/// Zeroed memory from the allocator, freed when it is dropped. Its bytes are reached only
+/// through the pointer it hands out, never through a reference to all of it, so stretches of it
+/// that are lent apart stay valid however its owner moves and whatever else of it is lent.
+pub(crate) struct Memory(NonNull<[u8]>);
 
 // SAFETY: the memory is an allocation of its own, which any thread may use and free.
 unsafe impl Send for Memory {}
@@ -21,13 +23,18 @@ unsafe impl Send for Memory {}
 unsafe impl Sync for Memory {}
 
 impl Memory {
-    fn new(size: usize) -> Memory {
+    pub(crate) fn new(size: usize) -> Memory {
         let memory = Box::into_raw(vec![0u8; size].into_boxed_slice());
         Memory(NonNull::new(memory).expect("a box is never null"))
     }
 
-    fn start(&self) -> NonNull<u8> {
+    pub(crate) fn start(&self) -> NonNull<u8> {
         self.0.cast()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
     }
 }
 
