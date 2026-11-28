@@ -74,9 +74,12 @@ pub struct MessageReads {
     rooms: Rooms,
     headers: Headers,
     /// The most messages one call takes: the system cuts a call for more down to
-    /// `kern.ipc.maxrecvmsgx`.
+    /// `kern.ipc.maxrecvmsgx`, and refuses one that names more than [`MESSAGES`].
     most: usize,
 }
+
+/// The most messages one `recvmsg_x` may name.
+const MESSAGES: usize = 1024;
 
 impl MessageReads {
     pub(super) fn new() -> Result<MessageReads> {
@@ -91,7 +94,12 @@ impl MessageReads {
             let error = std::io::Error::last_os_error();
             return Err(std::io::Error::new(error.kind(), format!("reading kern.ipc.maxrecvmsgx: {error}")));
         }
-        Ok(MessageReads { rooms: Rooms::default(), headers: Headers::default(), most: (most as usize).max(1) })
+        Ok(MessageReads::taking(most as usize))
+    }
+
+    /// A reader on a system that cuts a call down to `limit` messages.
+    fn taking(limit: usize) -> MessageReads {
+        MessageReads { rooms: Rooms::default(), headers: Headers::default(), most: limit.clamp(1, MESSAGES) }
     }
 }
 
@@ -429,6 +437,23 @@ mod tests {
         assert_eq!(found[count - 1], ((count - 1) as u32).to_be_bytes());
         assert!(!filled.dry && filled.error.is_none(), "a batch that was filled says that the socket may hold more");
         assert_eq!(stats.calls, 2);
+    }
+
+    /// The system refuses a call that names more than 1024 messages. A reader on a system that
+    /// is set to take more per call asks for no more than that.
+    #[test]
+    fn a_read_names_no_more_messages_than_a_call_may() {
+        let (near, far) = pair();
+        let sent: Vec<Vec<u8>> = (0..10u32).map(|number| number.to_be_bytes().to_vec()).collect();
+        let list = Pieces(sent.iter().map(|message| vec![message.clone()]).collect());
+        assert_eq!(MessageWrites::default().write(near.as_raw_fd(), &list, &mut WriterStats::default()).unwrap(), 10);
+        let frames = MESSAGES + 76;
+        let mut reads = MessageReads::taking(usize::MAX);
+        let (mut slots, mut stats) = (Slots::new(frames).unwrap(), ReaderStats::default());
+        let (found, filled) = read(&mut reads, &far, &mut slots, frames, &mut stats);
+        assert!(filled.dry && filled.error.is_none(), "{:?}", filled.error);
+        assert_eq!(found, sent);
+        assert_eq!(stats.calls, 1);
     }
 
     /// The system says of a `sendmsg_x` with an empty message that it took the messages before
