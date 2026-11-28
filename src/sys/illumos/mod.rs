@@ -167,9 +167,14 @@ pub struct Interface {
 }
 
 impl Interface {
-    /// The interface called `name`, up if its first logical interface is.
+    /// The interface called `name`, up if its first logical interface is: the IPv4 one, or the
+    /// IPv6 one of an interface that has IPv6 alone.
     fn new(name: String) -> Result<Interface> {
-        let up = flags(libc::AF_INET, &name)? & sys::IFF_UP != 0;
+        let first = match flags(libc::AF_INET, &name) {
+            Err(error) if error.raw_os_error() == Some(libc::ENXIO) => flags(libc::AF_INET6, &name),
+            first => first,
+        };
+        let up = first? & sys::IFF_UP != 0;
         Ok(Interface { index: index_of(&name)?, name, up: AtomicBool::new(up) })
     }
 
