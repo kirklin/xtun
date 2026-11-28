@@ -100,8 +100,8 @@ pub trait Tunnel: Send + Sync + Sized + 'static {
             Up::No => self.set_up(false)?,
             Up::Unchanged => {}
         }
-        if options.persist {
-            self.set_persist(true)?;
+        if let Some(persist) = options.persist {
+            self.set_persist(persist)?;
         }
         Ok(())
     }

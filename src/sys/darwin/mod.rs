@@ -59,7 +59,7 @@ impl super::Tunnel for Tun {
         if options.queues != 1 {
             return Err(Error::new(ErrorKind::Unsupported, "these interfaces have one queue"));
         }
-        if options.persist {
+        if options.persist == Some(true) {
             return Err(Error::new(ErrorKind::Unsupported, "a utun interface goes away with its socket"));
         }
         let unit = match options.name.as_deref() {

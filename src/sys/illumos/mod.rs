@@ -56,7 +56,7 @@ impl super::Tunnel for Tun {
         if options.packet_information {
             return Err(Error::new(ErrorKind::Unsupported, "illumos's tun devices carry bare IP packets"));
         }
-        if options.persist {
+        if options.persist == Some(true) {
             return Err(Error::new(ErrorKind::Unsupported, NO_PERSIST));
         }
         let requested = options.name.as_deref().map(unit_of).transpose()?;

@@ -750,6 +750,10 @@ fn queue_length_persistence_and_exclusive_names() {
     device.set_persist(false).unwrap();
     drop((device, queues));
     assert!(!exists("xtuntest15"));
+    // A builder told that the interface does not persist takes the persistence off one it takes over.
+    drop(builder("xtuntest15").persist(true).build().unwrap());
+    drop(builder("xtuntest15").persist(false).build().unwrap());
+    assert!(!exists("xtuntest15"));
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]

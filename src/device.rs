@@ -120,8 +120,9 @@ pub struct Options {
     pub up: Up,
     /// Whether each address brings a route to its subnet.
     pub prefix_routes: bool,
-    /// Whether the interface stays after the device is gone.
-    pub persist: bool,
+    /// Whether the interface stays after the device is gone; left out, an interface that is
+    /// taken over stays as it was.
+    pub persist: Option<bool>,
     /// Whether an interface of the name that already exists is taken over.
     pub reuse: bool,
     /// Whether reads and writes go through io_uring.
@@ -176,7 +177,7 @@ impl<L: Layer> Default for Builder<L> {
                 packet_information: false,
                 up: Up::Yes,
                 prefix_routes: true,
-                persist: false,
+                persist: None,
                 reuse: true,
                 #[cfg(target_os = "linux")]
                 uring: Uring::Auto,
@@ -263,9 +264,10 @@ impl<L: Layer> Builder<L> {
         self
     }
 
-    /// Whether the interface stays after the last handle is dropped. Off by default.
+    /// Whether the interface stays after the last handle is dropped. Left out, a new interface
+    /// does not, and one that is taken over stays as it was.
     pub fn persist(mut self, persist: bool) -> Builder<L> {
-        self.options.persist = persist;
+        self.options.persist = Some(persist);
         self
     }
 

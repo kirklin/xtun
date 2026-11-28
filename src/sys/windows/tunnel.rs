@@ -132,7 +132,7 @@ impl crate::sys::Tunnel for Tun {
 
     fn create(options: &Options) -> Result<Tun> {
         check_options(options)?;
-        if options.persist {
+        if options.persist == Some(true) {
             return Err(no_persist());
         }
         let windows = &options.windows;
@@ -181,8 +181,16 @@ impl crate::sys::Tunnel for Tun {
         Offload::default()
     }
 
-    fn set_persist(&self, _persist: bool) -> Result<()> {
-        Err(no_persist())
+    /// An adapter made here goes with the device; one that was there before stays, as its own
+    /// program has it.
+    fn set_persist(&self, persist: bool) -> Result<()> {
+        if persist {
+            return Err(no_persist());
+        }
+        if !self.handle.created {
+            return Err(Error::new(ErrorKind::Unsupported, "a Wintun adapter that was there before stays when the device goes"));
+        }
+        Ok(())
     }
 
     fn configure(&self, options: &Options) -> Result<()> {

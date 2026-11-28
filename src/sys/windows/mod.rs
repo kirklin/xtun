@@ -101,8 +101,8 @@ fn configure<T: super::Tunnel>(tunnel: &T, options: &Options) -> Result<()> {
         Up::No => tunnel.set_up(false)?,
         Up::Unchanged => {}
     }
-    if options.persist {
-        tunnel.set_persist(true)?;
+    if let Some(persist) = options.persist {
+        tunnel.set_persist(persist)?;
     }
     Ok(())
 }

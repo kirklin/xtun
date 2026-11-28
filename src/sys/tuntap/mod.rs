@@ -160,7 +160,7 @@ impl super::Tunnel for Tunnel {
         if options.ethernet && options.packet_information {
             return Err(Error::new(ErrorKind::InvalidInput, "Ethernet frames carry no packet information"));
         }
-        let opened = open(options.ethernet, options.name.as_deref(), options.reuse, options.persist)?;
+        let opened = open(options.ethernet, options.name.as_deref(), options.reuse, options.persist == Some(true))?;
         let offloads = if options.offload && !options.packet_information { Offloads::On } else { Offloads::Off };
         let tunnel = Tunnel::wrap(opened, options.ethernet, offloads)?;
         tunnel.packet_information.store(options.packet_information, Ordering::Relaxed);
@@ -232,8 +232,8 @@ impl super::Tunnel for Tunnel {
             Up::Unchanged => self.interface.settle()?,
         }
         // Last, so that an interface whose setup failed does not stay behind.
-        if options.persist {
-            super::Tunnel::set_persist(self, true)?;
+        if let Some(persist) = options.persist {
+            super::Tunnel::set_persist(self, persist)?;
         }
         Ok(())
     }
