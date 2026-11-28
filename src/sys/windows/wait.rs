@@ -4,7 +4,7 @@
 use std::ffi::c_void;
 use std::io::{Error, ErrorKind, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
@@ -240,12 +240,16 @@ impl Drop for Watch {
 /// What an interrupt is made of: a manual-reset event.
 pub struct Signal {
     event: Event,
+    /// Whether the interrupt is triggered: the event is signalled while it is.
     set: AtomicBool,
+    /// Held while a trigger or a reset changes the flag and the event, so that one that comes at
+    /// the same time finds both changed or neither.
+    changing: Mutex<()>,
 }
 
 impl Signal {
     pub fn new() -> Result<Signal> {
-        Ok(Signal { event: Event::new(true)?, set: AtomicBool::new(false) })
+        Ok(Signal { event: Event::new(true)?, set: AtomicBool::new(false), changing: Mutex::new(()) })
     }
 
     pub fn handle(&self) -> HANDLE {
@@ -256,14 +260,20 @@ impl Signal {
         self.set.load(Ordering::Acquire)
     }
 
+    /// Signals the event, then sets the flag.
     pub fn trigger(&self) -> Result<()> {
+        let _changing = self.changing.lock().unwrap_or_else(PoisonError::into_inner);
+        self.event.set()?;
         self.set.store(true, Ordering::Release);
-        self.event.set()
+        Ok(())
     }
 
+    /// Resets the event, then clears the flag.
     pub fn reset(&self) -> Result<()> {
+        let _changing = self.changing.lock().unwrap_or_else(PoisonError::into_inner);
+        self.event.reset()?;
         self.set.store(false, Ordering::Release);
-        self.event.reset()
+        Ok(())
     }
 }
 

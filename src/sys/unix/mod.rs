@@ -8,7 +8,7 @@ use std::io::{self, ErrorKind};
 use std::os::fd::{AsFd, BorrowedFd};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -264,7 +264,11 @@ pub struct Signal {
     read: OwnedFd,
     /// The other end of a pipe; an eventfd is both ends.
     write: Option<OwnedFd>,
+    /// Whether the interrupt is triggered: the descriptor is readable while it is.
     set: AtomicBool,
+    /// Held while a trigger or a reset changes the flag and the descriptor, so that one that
+    /// comes at the same time finds both changed or neither.
+    changing: Mutex<()>,
 }
 
 impl Signal {
@@ -277,12 +281,12 @@ impl Signal {
                 return Err(io::Error::last_os_error());
             }
             // SAFETY: `fd` is new and owned by nobody else.
-            Ok(Signal { read: unsafe { OwnedFd::from_raw_fd(fd) }, write: None, set: AtomicBool::new(false) })
+            Ok(Signal { read: unsafe { OwnedFd::from_raw_fd(fd) }, write: None, set: AtomicBool::new(false), changing: Mutex::new(()) })
         }
         #[cfg(not(any(target_os = "linux", target_os = "android")))]
         {
             let (read, write) = pipe()?;
-            Ok(Signal { read, write: Some(write), set: AtomicBool::new(false) })
+            Ok(Signal { read, write: Some(write), set: AtomicBool::new(false), changing: Mutex::new(()) })
         }
     }
 
@@ -294,8 +298,10 @@ impl Signal {
         self.set.load(Ordering::Acquire)
     }
 
+    /// Makes the descriptor readable, then sets the flag.
     pub fn trigger(&self) -> io::Result<()> {
-        if self.set.swap(true, Ordering::AcqRel) {
+        let _changing = self.changing.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.set.load(Ordering::Acquire) {
             return Ok(());
         }
         let one = 1u64.to_ne_bytes();
@@ -305,14 +311,16 @@ impl Signal {
         };
         // SAFETY: `bytes` is readable for its length.
         if unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) } < 0 {
-            self.set.store(false, Ordering::Release);
             return Err(io::Error::last_os_error());
         }
+        self.set.store(true, Ordering::Release);
         Ok(())
     }
 
+    /// Empties the descriptor, then clears the flag.
     pub fn reset(&self) -> io::Result<()> {
-        if !self.set.swap(false, Ordering::AcqRel) {
+        let _changing = self.changing.lock().unwrap_or_else(PoisonError::into_inner);
+        if !self.set.load(Ordering::Acquire) {
             return Ok(());
         }
         let mut sink = [0u8; 64];
@@ -321,14 +329,16 @@ impl Signal {
             let read = unsafe { libc::read(self.read.as_raw_fd(), sink.as_mut_ptr().cast(), sink.len()) };
             if read <= 0 {
                 let error = io::Error::last_os_error();
-                return match error.kind() {
-                    ErrorKind::WouldBlock => Ok(()),
+                match error.kind() {
+                    ErrorKind::WouldBlock => break,
                     ErrorKind::Interrupted => continue,
-                    _ if read == 0 => Ok(()),
-                    _ => Err(error),
-                };
+                    _ if read == 0 => break,
+                    _ => return Err(error),
+                }
             }
         }
+        self.set.store(false, Ordering::Release);
+        Ok(())
     }
 }
 
@@ -513,6 +523,33 @@ mod tests {
         theirs.read_exact(&mut taken).unwrap();
         for wait in waits {
             tokio::time::timeout(std::time::Duration::from_secs(5), wait).await.expect("each writer is woken once there is room").unwrap();
+        }
+    }
+
+    /// However triggers and resets from several threads interleave, the flag and the descriptor
+    /// agree once they are done.
+    #[test]
+    fn an_interrupt_that_threads_trigger_and_reset_at_once_stays_whole() {
+        let (read, _write) = std::os::unix::net::UnixStream::pair().unwrap();
+        let signal = Signal::new().unwrap();
+        for _ in 0..200 {
+            std::thread::scope(|scope| {
+                for thread in 0..4 {
+                    let signal = &signal;
+                    scope.spawn(move || {
+                        for turn in 0..250 {
+                            if (turn + thread) % 2 == 0 { signal.trigger().unwrap() } else { signal.reset().unwrap() }
+                        }
+                    });
+                }
+            });
+            signal.reset().unwrap();
+            let soon = Some(Instant::now() + std::time::Duration::from_millis(1));
+            let error = wait(read.as_raw_fd(), libc::POLLIN, Some(&signal), soon).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::TimedOut, "a reset interrupt lets waits go on");
+            signal.trigger().unwrap();
+            let error = wait(read.as_raw_fd(), libc::POLLIN, Some(&signal), soon).unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Interrupted, "a triggered interrupt ends waits");
         }
     }
 
