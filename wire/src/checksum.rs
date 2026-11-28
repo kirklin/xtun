@@ -29,11 +29,12 @@ impl Sum {
         Sum { acc: add(self.acc, part), odd: self.odd ^ (data.len() % 2 == 1) }
     }
 
-    /// Adds a 16-bit value, such as a length or a checksum field read as big-endian. Where the
-    /// value sits in the range does not matter.
+    /// Adds a 16-bit value, such as a length or a checksum field read as big-endian, as its two
+    /// bytes in that order would be added at the place the sum has reached.
     #[inline]
     pub fn word(self, value: u16) -> Sum {
-        Sum { acc: add(self.acc, u64::from(value.to_be())), odd: self.odd }
+        let part = if self.odd { value.to_le() } else { value.to_be() };
+        Sum { acc: add(self.acc, u64::from(part)), odd: self.odd }
     }
 
     /// Adds the unfolded value of another sum that started at an even offset.
@@ -415,6 +416,18 @@ mod tests {
                 start = cut;
             }
             prop_assert_eq!(sum.fold(), reference(&data));
+        }
+
+        #[test]
+        fn a_word_adds_what_its_two_bytes_add_wherever_the_sum_is(
+            data in proptest::collection::vec(any::<u8>(), 0..64),
+            cut in any::<usize>(),
+            value in any::<u16>(),
+        ) {
+            let cut = cut % (data.len() + 1);
+            let worded = Sum::ZERO.bytes(&data[..cut]).word(value).bytes(&data[cut..]);
+            let whole = [&data[..cut], &value.to_be_bytes()[..], &data[cut..]].concat();
+            prop_assert_eq!(worded.fold(), reference(&whole));
         }
 
         #[test]
