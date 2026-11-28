@@ -10,8 +10,8 @@ use std::ops::Range;
 
 use crate::checksum::Sum;
 use crate::packet::{
-    CWR, Checksum, FIN, Gso, GsoKind, Head, PSH, Packet, Parts, TCP_CHECKSUM, UDP_CHECKSUM, adjust_partial, complete, each_in,
-    field_value, invalid, ipv4_header_checksum, link_len, read_u16, sum_in, write_u16,
+    CWR, Checksum, FIN, Gso, GsoKind, Head, PSH, Packet, Parts, TCP, TCP_CHECKSUM, UDP, UDP_CHECKSUM, adjust_partial, complete,
+    each_in, field_value, invalid, ipv4_header_checksum, link_len, read_u16, sum_in, transport_of, write_u16,
 };
 
 /// The longest headers a segment can repeat: IPv6 with extension headers and TCP options.
@@ -43,11 +43,15 @@ pub(crate) fn segment_header_len_head(head: Head<'_>, link: usize, checksum: Che
     }
     let ip = &data[link..];
     if v6 {
-        if start < link + 40 || ip.len() < 40 || 40 + usize::from(u16::from_be_bytes([ip[4], ip[5]])) != head.len - link {
+        if ip.len() < 40 || 40 + usize::from(u16::from_be_bytes([ip[4], ip[5]])) != head.len - link {
             return Err(invalid("the IPv6 segment's lengths do not add up"));
         }
-    } else if ip.len() < 20 || start < link + 20 || link + usize::from(ip[0] & 0x0f) * 4 != start {
-        return Err(invalid("the IPv4 segment's header length does not match"));
+    } else if ip.len() < 20 || head.len - link > usize::from(u16::MAX) {
+        return Err(invalid("the IPv4 segment is longer than an IPv4 packet can be"));
+    }
+    let (_, at, protocol) = transport_of(data, link)?;
+    if at != start || protocol != if tcp { TCP } else { UDP } {
+        return Err(invalid("the partial checksum does not start at the segment's own TCP or UDP header"));
     }
     let transport = if tcp {
         if usize::from(offset) != TCP_CHECKSUM || data.len() < start + 20 {
@@ -67,6 +71,9 @@ pub(crate) fn segment_header_len_head(head: Head<'_>, link: usize, checksum: Che
     let header_len = start + transport;
     if gso.segment_size == 0 || header_len >= head.len || header_len > MAX_HEADER {
         return Err(invalid("the segment has no payload, a zero segment size or headers that are too long"));
+    }
+    if header_len > data.len() {
+        return Err(invalid("the segment's headers go on past its first bytes"));
     }
     Ok(header_len as u16)
 }
@@ -601,6 +608,21 @@ pub(crate) mod tests {
         assert!(Frame::new(&mut no_header, checksum, Some(gso)).is_err(), "an IPv4 header length of zero");
         let frame = Frame::new(&mut bytes, checksum, Some(Gso { header_len: 9999, ..gso })).unwrap();
         assert_eq!(frame.gso().unwrap().header_len, 52, "the header length comes from the packet");
+
+        let (mut udp, udp_checksum, udp_gso, _) = segment(&Flow::udp(false), 1000, &payload(6, 3000));
+        let as_tcp = Checksum::Partial { start: 20, offset: 16 };
+        assert!(Frame::new(&mut udp, as_tcp, Some(gso)).is_err(), "a UDP packet is no TCP segment");
+        let mut fragment = whole.clone();
+        fragment[6] |= 0x20;
+        assert!(Frame::new(&mut fragment, checksum, Some(gso)).is_err(), "a fragment");
+        let mut long = udp.clone();
+        long.resize(65_600, 0);
+        assert!(Frame::new(&mut long, udp_checksum, Some(udp_gso)).is_err(), "an IPv4 packet longer than IPv4 allows");
+        // The TCP options lie behind the first bytes that are there.
+        let short = Head { bytes: &whole[..41], len: whole.len() };
+        assert!(segment_header_len_head(short, 0, checksum, gso).is_err());
+        let short = Head { bytes: &udp[..25], len: udp.len() };
+        assert!(segment_header_len_head(short, 0, udp_checksum, udp_gso).is_err());
     }
 
     #[test]
