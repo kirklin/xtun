@@ -1,6 +1,6 @@
 [package]
 name = "xtun-wire"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 description = "The bytes of batched and offloaded packet I/O, without any device: checksums, cutting segments, joining packets and the prefixes devices put in front of frames"
