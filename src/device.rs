@@ -383,13 +383,6 @@ impl Builder<Ethernet> {
 
 #[cfg(windows)]
 impl<L: Layer> Builder<L> {
-    /// The adapter's GUID. Left out, it is derived from the name, so that the same name gets the
-    /// same adapter identity and Windows keeps its network profile.
-    pub fn guid(mut self, guid: u128) -> Builder<L> {
-        self.options.windows.guid = Some(guid);
-        self
-    }
-
     /// The MTU of IPv6, at least 1280, when it differs from IPv4's; [`Builder::mtu`] sets both.
     pub fn mtu_v6(mut self, mtu: u32) -> Builder<L> {
         self.options.windows.mtu_v6 = Some(mtu);
@@ -406,6 +399,14 @@ impl<L: Layer> Builder<L> {
 
 #[cfg(windows)]
 impl Builder<Ip> {
+    /// The adapter's GUID. Left out, it is derived from the name, so that the same name gets the
+    /// same adapter identity and Windows keeps its network profile. A TAP-Windows adapter gets
+    /// its GUID from the system.
+    pub fn guid(mut self, guid: u128) -> Builder<Ip> {
+        self.options.windows.guid = Some(guid);
+        self
+    }
+
     /// Where `wintun.dll` is; a relative path is taken from the current directory. Left out, it
     /// is looked for next to the program and in the system directory.
     pub fn wintun(mut self, path: impl Into<std::path::PathBuf>) -> Builder<Ip> {
